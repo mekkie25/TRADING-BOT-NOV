@@ -1,132 +1,249 @@
-# trading-engine/knowledge/sessions.py
-from datetime import datetime, time
+"""
+Module 2: Market Sessions & Time
+Depends on: common.py only.
 
-def get_session_sast(current_time_sast: datetime):
-    """
-    Takes the current SAST time (South Africa Standard Time, UTC+2).
-    Returns the session name, killzone status, and bot action rules.
-    """
-    t = current_time_sast.time()
-    month = current_time_sast.month
+Purpose: Know which session we are in, when it started, and when the market tends to move most.
+"""
+
+import pandas as pd
+from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+from typing import List, Optional, Tuple
+from enum import Enum
+
+# ==========================================
+# 1. CONFIGURATION & ENUMS
+# ==========================================
+
+# All times below are in the local exchange timezone
+TIMEZONE_LONDON = ZoneInfo("Europe/London")
+TIMEZONE_NY = ZoneInfo("America/New_York")
+TIMEZONE_TOKYO = ZoneInfo("Asia/Tokyo")
+
+UTC = ZoneInfo("UTC")
+
+class SessionName(Enum):
+    ASIA = "Asia"
+    LONDON = "London"
+    NEW_YORK = "New York"
+    LONDON_NY_OVERLAP = "London/NY Overlap"
+    OFF_SESSION = "Off Session"
+
+@dataclass
+class SessionConfig:
+    # Standard Sessions (Local exchange times)
+    asia_start: time = time(9, 0)    # 09:00 Tokyo
+    asia_end: time = time(18, 0)     # 18:00 Tokyo
     
-    # Determine if we are in the "Summer" (Apr-Oct) or "Winter" (Nov-Mar) period
-    is_summer = 4 <= month <= 10
+    london_start: time = time(8, 0)  # 08:00 London
+    london_end: time = time(16, 30)  # 16:30 London
+    
+    ny_start: time = time(8, 0)      # 08:00 New York
+    ny_end: time = time(17, 0)       # 17:00 New York
+    
+    # Killzones (Optional windows where volatility is highest)
+    enable_killzones: bool = True
+    london_killzone_start: time = time(7, 0)  # 07:00 London
+    london_killzone_end: time = time(10, 0)   # 10:00 London
+    
+    ny_killzone_start: time = time(8, 30)     # 08:30 New York
+    ny_killzone_end: time = time(11, 0)       # 11:00 New York
 
-    # ==========================================
-    # 1. ASIAN SESSION & DEAD ZONE
-    # ==========================================
-    if time(2, 0) <= t < time(11, 0):
-        # Asian Dead Zone (04:00 to 06:00 SAST) - Lowest volume
-        if time(4, 0) <= t < time(6, 0):
-            return {
-                "session": "ASIAN_DEAD_ZONE",
-                "killzone": False,
-                "strategy_type": "NO_TRADING",
-                "warning": "Lowest volume of the day. Do not trade."
-            }
-        # General Asian Session
-        return {
-            "session": "ASIAN",
-            "killzone": False,
-            "strategy_type": "Range / Mean Reversion",
-            "warning": "Track High/Low for London sweeps. No breakouts."
-        }
+@dataclass
+class SessionInfo:
+    name: SessionName
+    is_active: bool
+    is_killzone: bool
+    start_time_utc: Optional[datetime]
+    end_time_utc: Optional[datetime]
 
-    # ==========================================
-    # 2. LONDON SESSION & KILL ZONES (2 Hours)
-    # ==========================================
-    if is_summer:
-        # Summer London (Apr-Oct)
-        if time(9, 0) <= t < time(11, 0):
-            return {
-                "session": "LONDON_KILLZONE",
-                "killzone": True,
-                "strategy_type": "Liquidity Sweep / Breakout",
-                "warning": "A++ Window. Hunt Asian High/Low sweeps."
-            }
-        elif time(9, 0) <= t < time(18, 0):
-            return {"session": "LONDON", "killzone": False, "strategy_type": "Trend Continuation"}
-    else:
-        # Winter London (Nov-Mar)
-        if time(10, 0) <= t < time(12, 0):
-            return {
-                "session": "LONDON_KILLZONE",
-                "killzone": True,
-                "strategy_type": "Liquidity Sweep / Breakout",
-                "warning": "A++ Window. Hunt Asian High/Low sweeps."
-            }
-        elif time(10, 0) <= t < time(19, 0):
-            return {"session": "LONDON", "killzone": False, "strategy_type": "Trend Continuation"}
+# ==========================================
+# 2. HELPER FUNCTIONS
+# ==========================================
 
-    # ==========================================
-    # 3. NEW YORK & OVERLAP KILL ZONES (2 Hours)
-    # ==========================================
-    if is_summer:
-        # Summer NY (Apr-Oct)
-        if time(14, 0) <= t < time(16, 0):
-            return {
-                "session": "NY_AM_KILLZONE",
-                "killzone": True,
-                "strategy_type": "High Volatility Breakout",
-                "warning": "A++ Window. London/NY overlap. US Data hits at 14:30."
-            }
-        elif time(14, 0) <= t < time(23, 0):
-            return {"session": "NEW_YORK", "killzone": False, "strategy_type": "Continuation / Reversal"}
-            
-    else:
-        # Winter NY (Nov-Mar)
-        if time(15, 0) <= t < time(17, 0):
-            return {
-                "session": "NY_AM_KILLZONE",
-                "killzone": True,
-                "strategy_type": "High Volatility Breakout",
-                "warning": "A++ Window. London/NY overlap. US Data hits at 15:30."
-            }
-        elif time(15, 0) <= t < time(0, 0):
-            return {"session": "NEW_YORK", "killzone": False, "strategy_type": "Continuation / Reversal"}
+def _ensure_utc(dt: datetime) -> datetime:
+    """Ensures a datetime is timezone-aware and in UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
-    # ==========================================
-    # 4. DEAD ZONES (NO TRADING)
-    # ==========================================
-    # NY Lunch Dead Zone (19:00 to 20:00 SAST)
-    if time(19, 0) <= t < time(20, 0):
-        return {
-            "session": "NY_LUNCH_DEAD_ZONE",
-            "killzone": False,
-            "strategy_type": "NO_TRADING",
-            "warning": "Spreads widen. Do not enter new trades."
-        }
+def _is_weekend(dt: datetime) -> bool:
+    """Forex markets are closed from Friday 22:00 UTC to Sunday 22:00 UTC."""
+    # 4 = Friday, 5 = Saturday, 6 = Sunday
+    if dt.weekday() == 5: # Saturday
+        return True
+    if dt.weekday() == 4 and dt.hour >= 22: # Friday late
+        return True
+    if dt.weekday() == 6 and dt.hour < 22: # Sunday early
+        return True
+    return False
 
-    # Late NY / Rollover Dead Zone (22:00 to 02:00 SAST)
-    if t >= time(22, 0) or t < time(2, 0):
-        return {
-            "session": "LATE_DEAD_ZONE",
-            "killzone": False,
-            "strategy_type": "NO_TRADING",
-            "warning": "Rollover period. Dangerous spreads. Do not trade."
-        }
+def _get_local_time(dt_utc: datetime, tz: ZoneInfo) -> datetime:
+    """Converts UTC to the local exchange timezone."""
+    return dt_utc.astimezone(tz)
 
-    # Fallback for any unhandled minutes (e.g., 20:00 - 22:00 SAST)
-    return {
-        "session": "TRANSITION",
-        "killzone": False,
-        "strategy_type": "NO_TRADING",
-        "warning": "Waiting for next session."
-    }
+# ==========================================
+# 3. CORE SESSION LOGIC
+# ==========================================
 
-def get_asian_range(asian_bars):
+def get_current_session(dt: datetime, config: SessionConfig = SessionConfig()) -> SessionInfo:
     """
-    Takes all the candles from the Asian session (02:00 to 11:00 SAST)
-    and returns the High and Low. London often sweeps these levels.
+    Determines the current session, handling DST automatically.
     """
-    if not asian_bars:
+    dt_utc = _ensure_utc(dt)
+    
+    if _is_weekend(dt_utc):
+        return SessionInfo(SessionName.OFF_SESSION, False, False, None, None)
+
+    # Convert to local times
+    london_local = _get_local_time(dt_utc, TIMEZONE_LONDON)
+    ny_local = _get_local_time(dt_utc, TIMEZONE_NY)
+    tokyo_local = _get_local_time(dt_utc, TIMEZONE_TOKYO)
+    
+    # Check local times against config (note: simple time check ignores midnight crossing for brevity)
+    is_asia = config.asia_start <= tokyo_local.time() < config.asia_end
+    is_london = config.london_start <= london_local.time() < config.london_end
+    is_ny = config.ny_start <= ny_local.time() < config.ny_end
+    
+    # Check for overlap
+    is_overlap = is_london and is_ny
+    
+    # Check killzones
+    is_kz = False
+    if config.enable_killzones:
+        is_london_kz = config.london_killzone_start <= london_local.time() < config.london_killzone_end
+        is_ny_kz = config.ny_killzone_start <= ny_local.time() < config.ny_killzone_end
+        is_kz = is_london_kz or is_ny_kz
+
+    if is_overlap:
+        name = SessionName.LONDON_NY_OVERLAP
+    elif is_london:
+        name = SessionName.LONDON
+    elif is_ny:
+        name = SessionName.NEW_YORK
+    elif is_asia:
+        name = SessionName.ASIA
+    else:
+        name = SessionName.OFF_SESSION
+
+    return SessionInfo(
+        name=name,
+        is_active=(name != SessionName.OFF_SESSION),
+        is_killzone=is_kz,
+        start_time_utc=None, # Can be populated if needed
+        end_time_utc=None
+    )
+
+def _get_session_start_dt(dt_utc: datetime, session_name: SessionName, config: SessionConfig) -> Optional[datetime]:
+    """Helper to get the UTC start time of a specific session on a given day."""
+    if session_name == SessionName.ASIA:
+        tz, t = TIMEZONE_TOKYO, config.asia_start
+    elif session_name == SessionName.LONDON:
+        tz, t = TIMEZONE_LONDON, config.london_start
+    elif session_name == SessionName.NEW_YORK:
+        tz, t = TIMEZONE_NY, config.ny_start
+    else:
         return None
-        
-    asian_high = max([bar['high'] for bar in asian_bars])
-    asian_low = min([bar['low'] for bar in asian_bars])
+
+    # Get the date in the local timezone
+    local_date = dt_utc.astimezone(tz).date()
     
-    return {
-        "asian_high": asian_high,
-        "asian_low": asian_low,
-        "midpoint": (asian_high + asian_low) / 2
-    }
+    # Combine date and time, localized
+    local_dt = datetime.combine(local_date, t).replace(tzinfo=tz)
+    
+    return local_dt.astimezone(UTC)
+
+def get_session_start(dt: datetime, session_name: Optional[SessionName] = None, config: SessionConfig = SessionConfig()) -> Optional[datetime]:
+    """Returns the UTC start time of the current (or specified) session."""
+    dt_utc = _ensure_utc(dt)
+    
+    if session_name is None:
+        session_info = get_current_session(dt_utc, config)
+        if session_info.name == SessionName.OFF_SESSION:
+            return None
+        # If overlap, default to London start
+        session_name = SessionName.LONDON if session_info.name == SessionName.LONDON_NY_OVERLAP else session_info.name
+
+    return _get_session_start_dt(dt_utc, session_name, config)
+
+def minutes_since_session_start(dt: datetime, config: SessionConfig = SessionConfig()) -> float:
+    """Returns how many minutes have passed since the current session started."""
+    dt_utc = _ensure_utc(dt)
+    start = get_session_start(dt_utc, config=config)
+    if start is None:
+        return 0.0
+    return (dt_utc - start).total_seconds() / 60.0
+
+# ==========================================
+# 4. CANDLE FILTERING LOGIC
+# ==========================================
+
+def get_session_candles(df: pd.DataFrame, dt: datetime, config: SessionConfig = SessionConfig()) -> pd.DataFrame:
+    """
+    Filters a DataFrame to return only the candles from the current session start up to 'dt'.
+    Assumes 'time' column is UTC datetime.
+    """
+    dt_utc = _ensure_utc(dt)
+    start = get_session_start(dt_utc, config=config)
+    
+    if start is None:
+        return pd.DataFrame() # Empty if off-session
+        
+    # Filter data
+    mask = (df['time'] >= start) & (df['time'] <= dt_utc)
+    return df[mask]
+
+def get_session_open_price(df: pd.DataFrame, dt: datetime, config: SessionConfig = SessionConfig()) -> Optional[float]:
+    """Gets the open price of the first candle in the current session."""
+    session_candles = get_session_candles(df, dt, config)
+    if session_candles.empty:
+        return None
+    return float(session_candles.iloc[0]['open'])
+
+def get_session_high_low_so_far(df: pd.DataFrame, dt: datetime, config: SessionConfig = SessionConfig()) -> Tuple[Optional[float], Optional[float]]:
+    """Gets the highest high and lowest low of the session so far."""
+    session_candles = get_session_candles(df, dt, config)
+    if session_candles.empty:
+        return None, None
+    
+    high = float(session_candles['high'].max())
+    low = float(session_candles['low'].min())
+    return high, low
+
+def get_previous_session_high_low(df: pd.DataFrame, dt: datetime, session_name: SessionName, config: SessionConfig = SessionConfig()) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Gets the high and low of the PREVIOUS session of the given type.
+    Example: If I ask for LONDON, it finds the London session from yesterday.
+    """
+    dt_utc = _ensure_utc(dt)
+    
+    # Get start of current requested session
+    current_start = _get_session_start_dt(dt_utc, session_name, config)
+    if not current_start:
+        return None, None
+
+    # Go back 1 day in local time to find the previous session start
+    tz = TIMEZONE_LONDON if session_name in [SessionName.LONDON, SessionName.LONDON_NY_OVERLAP] else TIMEZONE_NY
+    local_date = current_start.astimezone(tz).date() - timedelta(days=1)
+    
+    # Skip weekends (logic simplified for brevity; robust production code would loop back to Friday)
+    while local_date.weekday() > 4:
+         local_date -= timedelta(days=1)
+         
+    t = config.london_start if session_name == SessionName.LONDON else config.ny_start
+    prev_local_dt = datetime.combine(local_date, t).replace(tzinfo=tz)
+    prev_start_utc = prev_local_dt.astimezone(UTC)
+    
+    # To get the end, we can just look at the next few hours (e.g., 8 hours for London)
+    duration = timedelta(hours=8) 
+    prev_end_utc = prev_start_utc + duration
+    
+    # Filter the DataFrame
+    mask = (df['time'] >= prev_start_utc) & (df['time'] < prev_end_utc)
+    prev_candles = df[mask]
+    
+    if prev_candles.empty:
+        return None, None
+        
+    return float(prev_candles['high'].max()), float(prev_candles['low'].min())
