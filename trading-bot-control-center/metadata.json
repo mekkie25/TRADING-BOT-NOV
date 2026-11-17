@@ -1,0 +1,6 @@
+{
+  "name": "Trading Bot Control Center",
+  "description": "Automated forex trading bot control center for monitoring live execution, trade journaling, backtesting analytics, strategy grading rules, and cTrader broker configuration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
