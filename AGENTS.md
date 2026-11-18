@@ -47,3 +47,9 @@ Data (price candles, news calendar) feeds steps 2 and 7.
 - trading-engine/data/ = price data. trading-engine/news_feed/ = news calendar
 - trading-bot-control-center/ = the screen (UI)
 - Old bot, for reference only: github.com/mekkie25/trading-portal
+
+## The old bot (a source to borrow from)
+An earlier version of this bot exists. It has features the new bot lacks. It is on GitHub at github.com/mekkie25/trading-portal, and on this computer in the folder old-bot/ (read only, never edit it).
+- Full list of what is worth borrowing: docs/OLD_BOT.md. Read it before building anything new. The feature you are asked to build may already exist there.
+- Never copy old code blindly. It may have bugs. Read it, rebuild it to follow this project's rules and docs/CONTRACTS.md, and give it plain names.
+- After borrowing something, mark it DONE in docs/OLD_BOT.md and add a line to docs/DECISIONS.md.
