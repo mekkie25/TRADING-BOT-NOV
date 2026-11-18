@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Dict, Any
 
-from .fvg import FairValueGap, FVGDirection, FVGStatus, get_active_fvgs, FVGConfig
+from .fair_value_gap import FairValueGap, FVGDirection, FVGStatus, get_active_fvgs, FVGConfig
 
 # ==========================================
 # 1. CONFIGURATION & ENUMS

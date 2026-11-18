@@ -16,7 +16,7 @@ from .sessions import (
 from .liquidity import (
     get_liquidity_pools, LiquidityPool, PoolSide, PoolStatus, LiquidityConfig
 )
-from .candlesticks import describe_candle, CandleType, CandleConfig
+from .candlestick_anatomy import describe_candle, CandleType, CandleConfig
 
 # ==========================================
 # 1. CONFIGURATION & ENUMS

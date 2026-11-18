@@ -13,8 +13,8 @@ from typing import List, Optional, Dict, Any, Tuple
 from .sessions import get_current_session, SessionName, SessionConfig
 from .market_structure import get_market_structure, TrendState, MarketStructureConfig
 from .equilibrium import analyze as analyze_eq, RangeMode, PriceZone
-from .fvg import get_active_fvgs, FVGStatus, FVGConfig
-from .candlesticks import describe_candle, CandleType, CandleConfig
+from .fair_value_gap import get_active_fvgs, FVGStatus, FVGConfig
+from .candlestick_anatomy import describe_candle, CandleType, CandleConfig
 from .liquidity_types import (
     get_most_significant_pool, PoolSide, ClassifiedPool, 
     LiquidityType, LiquidityTypeConfig
