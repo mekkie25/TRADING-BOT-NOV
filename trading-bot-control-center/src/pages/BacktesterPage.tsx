@@ -67,19 +67,19 @@ export function BacktesterPage() {
   const [config, setConfig] = useState<BacktestConfig>({
     name: '',
     strategyId: '',
-    pairs: ['EURUSD', 'GBPUSD', 'USDZAR'],
-    timeframe: 'M15',
-    historyLength: '2y',
-    startingBalance: 200000,
-    currency: 'ZAR',
+    pairs: ['EURUSD'],
+    timeframe: 'H1',
+    historyLength: '1y',
+    startingBalance: 10000,
+    currency: 'USD',
     leverage: 100,
-    riskPerTradePercent: 1.0,
-    brokerAccountType: 'Raw Spread / ECN',
+    riskPerTradePercent: 2.0,
+    brokerAccountType: 'Standard',
     costs: {
-      spreadPips: 0.8,
-      commissionPerLot: 110,
-      slippagePips: 0.2,
-      swapPerNight: -35,
+      spreadPips: 1.0,
+      commissionPerLot: 7,
+      slippagePips: 0,
+      swapPerNight: 0,
     },
   });
   const [formError, setFormError] = useState<string | null>(null);
@@ -528,7 +528,7 @@ export function BacktesterPage() {
               </div>
               <div>
                 <label className="block text-[11px] text-slate-500 dark:text-slate-400 mb-1">
-                  Commission / Lot ({config.currency})
+                  Commission / Lot / Side ({config.currency})
                 </label>
                 <input
                   type="number"
@@ -567,19 +567,14 @@ export function BacktesterPage() {
               </div>
               <div>
                 <label className="block text-[11px] text-slate-500 dark:text-slate-400 mb-1">
-                  Swap / Night ({config.currency})
+                  Swap / Night ({config.currency}) - not modeled
                 </label>
                 <input
                   type="number"
-                  step={5}
+                  disabled
+                  step={1}
                   value={config.costs.swapPerNight}
-                  onChange={(e) =>
-                    setConfig((c) => ({
-                      ...c,
-                      costs: { ...c.costs, swapPerNight: Number(e.target.value) },
-                    }))
-                  }
-                  className={`${inputClass} font-mono py-1.5 px-2.5`}
+                  className={`${inputClass} font-mono py-1.5 px-2.5 opacity-60`}
                 />
               </div>
             </div>

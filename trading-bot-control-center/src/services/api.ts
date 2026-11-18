@@ -24,6 +24,7 @@ import type {
   JournalStats,
   JournalTrade,
   KillSwitchResult,
+  LiveMarketDataInfo,
   LiveVsBacktestComparison,
   ManualOrderPayload,
   ModifyPositionSlTpPayload,
@@ -241,6 +242,21 @@ export const api = {
     }
     // Real FastAPI call replaces mock data
     return requestJson<ForexPair[]>('/api/market/pairs');
+  },
+
+  async getLiveMarketData(): Promise<LiveMarketDataInfo> {
+    if (USE_MOCK) {
+      await delay(50);
+      return {
+        connectionState: 'Disconnected',
+        environment: 'Demo',
+        symbol: 'EURUSD',
+        message: 'Mock mode is enabled; no broker data is connected.',
+        quote: null,
+        lastClosedCandle: null,
+      };
+    }
+    return requestJson<LiveMarketDataInfo>('/api/market/live');
   },
 
   // --- Dashboard & Bot Control ---

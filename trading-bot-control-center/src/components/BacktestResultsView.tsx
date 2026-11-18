@@ -128,6 +128,23 @@ export function BacktestResultsView({ result }: { result: BacktestResult }) {
         </div>
       </div>
 
+      {result.prototypeStatus === 'unverified' && (
+        <div
+          role="alert"
+          className="flex gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div>
+            <p className="font-semibold">Prototype results — unverified; do not treat as proven performance.</p>
+            {result.assumptions && (
+              <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs">
+                {result.assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Tabs Navigation */}
       <div className="flex items-center gap-1 overflow-x-auto rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-800/90 dark:bg-[#0B0F17] p-1.5">
         {TABS.map((t) => (

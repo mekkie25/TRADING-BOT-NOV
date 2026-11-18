@@ -13,7 +13,7 @@ allowed_impacts:
   - orange
   - gray
 headless: true
-schedule_preset: weekly
+schedule_preset: hourly
 viewer_host: 127.0.0.1
 viewer_port: 8501
 

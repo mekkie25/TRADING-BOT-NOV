@@ -1,9 +1,4 @@
-"""
-Module 6: Inverse Fair Value Gaps (IFVG)
-Depends on: fvg.py, candlesticks.py, common.py.
-
-Purpose: Recognise when a gap flips and starts working the other way.
-"""
+"""Detect and report configured inversions of fair value gaps."""
 
 import pandas as pd
 from dataclasses import dataclass
@@ -166,12 +161,31 @@ def analyze(df: pd.DataFrame, config: IFVGConfig = IFVGConfig()) -> Dict[str, An
     
     fresh = [i for i in ifvgs if i.status == IFVGStatus.FRESH]
     retested = [i for i in ifvgs if i.status == IFVGStatus.RETESTED]
+    failed = [i for i in ifvgs if i.status == IFVGStatus.FAILED]
+    if ifvgs:
+        descriptions = []
+        for item in ifvgs:
+            description = (
+                f"{item.new_direction.value.lower()} inverse fair value gap "
+                f"from {item.bottom} to {item.top}, originally created at "
+                f"{item.original_fvg.creation_time}, inverted at {item.inverted_at}; "
+                f"status {item.status.value.lower()}."
+            )
+            if item.retest_time is not None:
+                description += f" Retested at {item.retest_time}."
+            descriptions.append(description)
+        summary = " ".join(descriptions)
+    else:
+        summary = "No inverse fair value gaps were found."
     
     return {
+        "summary": summary,
         "current_price": current_price,
         "fresh_bearish_ifvgs": [i for i in fresh if i.new_direction == FVGDirection.BEARISH],
         "fresh_bullish_ifvgs": [i for i in fresh if i.new_direction == FVGDirection.BULLISH],
         "retested_bearish_ifvgs": [i for i in retested if i.new_direction == FVGDirection.BEARISH],
         "retested_bullish_ifvgs": [i for i in retested if i.new_direction == FVGDirection.BULLISH],
+        "failed_bearish_ifvgs": [i for i in failed if i.new_direction == FVGDirection.BEARISH],
+        "failed_bullish_ifvgs": [i for i in failed if i.new_direction == FVGDirection.BULLISH],
         "nearest_ifvg": get_nearest_ifvg(ifvgs, current_price)
     }

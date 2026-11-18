@@ -1,0 +1,67 @@
+"""Report a supplied take-profit level against the current market quote."""
+
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Literal
+
+
+PositionSide = Literal["LONG", "SHORT"]
+TakeProfitStatus = Literal["reached", "not_reached"]
+
+
+@dataclass(frozen=True)
+class TakeProfitObservation:
+    position_side: PositionSide
+    status: TakeProfitStatus
+    take_profit_price: float
+    reference_price: float
+    time: datetime
+    description: str
+
+
+def analyze_take_profit(
+    position_side: PositionSide,
+    take_profit_price: float,
+    bid: float,
+    ask: float,
+    quote_time: datetime,
+) -> TakeProfitObservation:
+    """Report whether the quote has reached a supplied take-profit level."""
+    if position_side not in ("LONG", "SHORT"):
+        raise ValueError("position_side must be either 'LONG' or 'SHORT'.")
+    if not all(
+        math.isfinite(price) and price > 0
+        for price in (take_profit_price, bid, ask)
+    ):
+        raise ValueError(
+            "take_profit_price, bid, and ask must be positive finite prices."
+        )
+    if bid > ask:
+        raise ValueError("bid must not be greater than ask.")
+    if quote_time.tzinfo is None or quote_time.utcoffset() != timedelta(0):
+        raise ValueError("quote_time must be timezone-aware UTC.")
+
+    reference_price = bid if position_side == "LONG" else ask
+    reached = (
+        reference_price >= take_profit_price
+        if position_side == "LONG"
+        else reference_price <= take_profit_price
+    )
+    status: TakeProfitStatus = "reached" if reached else "not_reached"
+    level_state = "has reached or passed" if reached else "has not reached"
+    side_label = position_side.lower()
+    price_name = "bid" if position_side == "LONG" else "ask"
+    description = (
+        f"The {side_label} take-profit level at {take_profit_price} {level_state}; "
+        f"the current {price_name} is {reference_price}."
+    )
+
+    return TakeProfitObservation(
+        position_side=position_side,
+        status=status,
+        take_profit_price=take_profit_price,
+        reference_price=reference_price,
+        time=quote_time,
+        description=description,
+    )

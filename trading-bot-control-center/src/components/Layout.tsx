@@ -3,6 +3,7 @@ import { NavLink } from 'react-router-dom';
 import {
   Activity,
   BookOpen,
+  CalendarDays,
   Cpu,
   Database,
   FileText,
@@ -35,6 +36,7 @@ const NAV_ITEMS = [
   { to: '/portfolio', label: 'Portfolio', icon: PieChart, end: false },
   { to: '/risk', label: 'Risk & Safety', icon: ShieldAlert, end: false },
   { to: '/data-manager', label: 'Data Manager', icon: Database, end: false },
+  { to: '/economic-calendar', label: 'Economic Calendar', icon: CalendarDays, end: false },
   { to: '/logs', label: 'Logs & Audit', icon: FileText, end: false },
   { to: '/system-status', label: 'System Status', icon: ServerCog, end: false },
   { to: '/settings', label: 'Settings', icon: Settings, end: false },

@@ -2,7 +2,7 @@
 Module 1: Candlestick Anatomy
 Depends on: common.py only.
 
-Purpose: Read any single candle (and small candle groups) at a glance and know who was in control.
+Purpose: Measure candle parts and identify configured candle patterns without choosing a trade.
 """
 
 import pandas as pd
@@ -153,10 +153,13 @@ def _is_outside_bar(c1: pd.Series, c2: pd.Series) -> bool:
 def analyze(df: pd.DataFrame, config: CandleConfig = CandleConfig(), lookback: int = 3) -> Dict[str, Any]:
     """
     Main entry point. Analyzes the end of a DataFrame.
-    Expects the DataFrame to be sorted chronologically (oldest to newest).
+    Expects candles sorted chronologically (oldest to newest). Multi-candle
+    patterns are only checked when enough candles are available.
     """
-    if df.empty or len(df) < lookback:
-        return {"error": f"Insufficient data. Need at least {lookback} candles."}
+    if lookback < 1:
+        raise ValueError("lookback must be at least one candle")
+    if df.empty:
+        return {"error": "No candles provided."}
 
     # Isolate the most recent candles for analysis
     recent = df.tail(lookback)

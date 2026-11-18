@@ -15,6 +15,7 @@ import { LogsPage } from './pages/LogsPage';
 import { SystemStatusPage } from './pages/SystemStatusPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { LoginPage } from './pages/LoginPage';
+import { EconomicCalendarPage } from './pages/EconomicCalendarPage';
 
 function AppRoutes() {
   const { isAuthenticated } = useAppContext();
@@ -44,6 +45,7 @@ function AppRoutes() {
         <Route path="/logs" element={<LogsPage />} />
         <Route path="/system-status" element={<SystemStatusPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/economic-calendar" element={<EconomicCalendarPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

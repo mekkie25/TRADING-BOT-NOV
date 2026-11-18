@@ -1,9 +1,4 @@
-"""
-Module 3: Market Structure
-Depends on: candlesticks.py, common.py.
-
-Purpose: Mark highs and lows and spot the moment structure shifts.
-"""
+"""Report confirmed swing points and a descriptive market-structure state."""
 
 import pandas as pd
 from dataclasses import dataclass
@@ -167,7 +162,14 @@ def _find_last_break(df: pd.DataFrame, swings: List[SwingPoint], config: MarketS
                 # For simplicity, if we are currently BEARISH and break a high, it's a CHoCH.
                 current_trend = _determine_trend_state(valid_swings)
                 break_type = BreakType.BOS if current_trend == TrendState.BULLISH else BreakType.CHOCH
-                return BreakEvent(break_type, BreakDirection.BULLISH, last_high, candle_time, float(candle['close']))
+                break_price = candle["close"] if config.require_close_for_break else candle["high"]
+                return BreakEvent(
+                    break_type,
+                    BreakDirection.BULLISH,
+                    last_high,
+                    candle_time,
+                    float(break_price),
+                )
 
         # Check Bearish Break (Breaking a Low)
         if last_low:
@@ -179,7 +181,14 @@ def _find_last_break(df: pd.DataFrame, swings: List[SwingPoint], config: MarketS
             if broke:
                 current_trend = _determine_trend_state(valid_swings)
                 break_type = BreakType.BOS if current_trend == TrendState.BEARISH else BreakType.CHOCH
-                return BreakEvent(break_type, BreakDirection.BEARISH, last_low, candle_time, float(candle['close']))
+                break_price = candle["close"] if config.require_close_for_break else candle["low"]
+                return BreakEvent(
+                    break_type,
+                    BreakDirection.BEARISH,
+                    last_low,
+                    candle_time,
+                    float(break_price),
+                )
 
     return BreakEvent(BreakType.NONE, BreakDirection.BULLISH, None, None, None)
 
@@ -234,11 +243,39 @@ def analyze(df: pd.DataFrame, config: MarketStructureConfig = MarketStructureCon
     labeled_swings = _label_swings(swings)
     trend = _determine_trend_state(labeled_swings)
     last_break = _find_last_break(df, labeled_swings, config)
+    last_swing_high = next(
+        (s for s in reversed(labeled_swings) if s.type == SwingType.HIGH),
+        None,
+    )
+    last_swing_low = next(
+        (s for s in reversed(labeled_swings) if s.type == SwingType.LOW),
+        None,
+    )
+    summary = f"Market structure is {trend.value.lower()}."
+    if last_swing_high is not None:
+        summary += (
+            f" Latest confirmed swing high is {last_swing_high.price} "
+            f"(formed at {last_swing_high.occurred_at}, "
+            f"confirmed at {last_swing_high.confirmed_at})."
+        )
+    if last_swing_low is not None:
+        summary += (
+            f" Latest confirmed swing low is {last_swing_low.price} "
+            f"(formed at {last_swing_low.occurred_at}, "
+            f"confirmed at {last_swing_low.confirmed_at})."
+        )
+    if last_break.type != BreakType.NONE:
+        summary += (
+            f" Latest reported break is {last_break.direction.value.lower()} "
+            f"{last_break.type.value} at {last_break.break_price} "
+            f"at {last_break.break_time}."
+        )
     
     return {
         "trend": trend,
         "last_break": last_break,
-        "last_swing_high": next((s for s in reversed(labeled_swings) if s.type == SwingType.HIGH), None),
-        "last_swing_low": next((s for s in reversed(labeled_swings) if s.type == SwingType.LOW), None),
+        "last_swing_high": last_swing_high,
+        "last_swing_low": last_swing_low,
+        "summary": summary,
         "all_swings": labeled_swings
     }

@@ -264,8 +264,32 @@ def analyze(df: pd.DataFrame, config: LiquidityConfig = LiquidityConfig()) -> Di
     current_price = float(df.iloc[-1]['close'])
     
     recent_sweeps = get_recent_sweeps(df, lookback=50, config=config)
+    if pools:
+        descriptions = [
+            (
+                f"{pool.side.value.lower().replace('_', '-')} pool at "
+                f"{pool.level}, formed at {pool.formed_at} from "
+                f"{pool.swing_count} similar swings; status "
+                f"{pool.status.value.lower()}."
+            )
+            for pool in pools
+        ]
+        summary = " ".join(descriptions)
+    else:
+        summary = "No liquidity pools were identified from the available candles."
+    if recent_sweeps:
+        summary += " " + " ".join(
+            (
+                f"{event.pool.side.value.lower().replace('_', '-')} pool at "
+                f"{event.pool.level} was swept at {event.event_time}; "
+                f"the wick reached {event.wick_extreme} and closed at "
+                f"{event.close_price}."
+            )
+            for event in recent_sweeps
+        )
     
     return {
+        "summary": summary,
         "current_price": current_price,
         "total_pools": len(pools),
         "untouched_pools": [p for p in pools if p.status == PoolStatus.UNTOUCHED],

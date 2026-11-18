@@ -97,7 +97,7 @@ export interface OpenPosition {
   floatingPnlPips: number;
   strategyId: string;
   strategyName: string;
-  setupGrade: SetupGrade;
+  setupGrade: SetupGrade | 'N/A';
   openedAt: string;
   swap: number;
   commission: number;
@@ -177,6 +177,33 @@ export interface SystemStatusInfo {
   } | null;
   botVersion: string;
   pythonVersion: string;
+}
+
+export interface LiveMarketQuoteInfo {
+  symbol: ForexPair;
+  time: string;
+  bid: number;
+  ask: number;
+}
+
+export interface LiveMarketCandleInfo {
+  symbol: ForexPair;
+  timeframe: 'M5';
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface LiveMarketDataInfo {
+  connectionState: ConnectionState;
+  environment: 'Demo' | 'Live' | 'Unknown';
+  symbol: ForexPair;
+  message: string;
+  quote: LiveMarketQuoteInfo | null;
+  lastClosedCandle: LiveMarketCandleInfo | null;
 }
 
 export interface MarketConditionTags {
@@ -409,7 +436,7 @@ export interface RobustnessAnalysis {
   monteCarloMaxDd95Percent: number;
   monteCarloRuinProbabilityPercent: number;
   parameterStability: ParameterStabilityMetric[];
-  overallStabilityLabel: 'Robust' | 'Moderate' | 'Fragile';
+  overallStabilityLabel: 'Robust' | 'Moderate' | 'Fragile' | 'N/A';
 }
 
 export interface BacktestJobStatus {
@@ -425,6 +452,47 @@ export interface BacktestResult {
   id: string;
   name: string;
   createdAt: string;
+  prototypeStatus?: 'unverified';
+  assumptions?: string[];
+  dataQuality?: {
+    status: 'PASS' | 'REVIEW' | 'ERROR';
+    timeframe: string;
+    candleCount: number;
+    firstTime: string | null;
+    lastTime: string | null;
+    missingColumns: string[];
+    invalidTimestampCount: number;
+    duplicateTimestampCount: number;
+    outOfOrderTimestampCount: number;
+    invalidPriceRowCount: number;
+    nonPositivePriceRowCount: number;
+    invalidOhlcRowCount: number;
+    zeroRangeCandleCount: number;
+    gapCount: number;
+    weekendShapedGapCount: number;
+    gapExamples: Array<{
+      previousTime: string;
+      nextTime: string;
+      gapHours: number;
+      category: string;
+    }>;
+    omittedGapCount: number;
+    largestCandleRanges: Array<{
+      time: string;
+      rangePercent: number;
+      previousClose: number;
+      high: number;
+      low: number;
+    }>;
+    largestCloseChanges: Array<{
+      previousTime: string;
+      time: string;
+      changePercent: number;
+      previousClose: number;
+      close: number;
+    }>;
+    summary: string;
+  };
   config: BacktestConfig;
   strategyName: string;
   overview: BacktestOverview;

@@ -1,9 +1,4 @@
-"""
-Module 5: Fair Value Gaps (FVG)
-Depends on: candlesticks.py, common.py.
-
-Purpose: Spot fair value gaps on any chart and know what they mean.
-"""
+"""Detect and report configured three-candle fair value gaps."""
 
 import pandas as pd
 import numpy as np
@@ -201,8 +196,22 @@ def analyze(df: pd.DataFrame, config: FVGConfig = FVGConfig()) -> Dict[str, Any]
     all_fvgs = get_active_fvgs(df, config=config)
     active_fvgs = [f for f in all_fvgs if f.status != FVGStatus.FILLED]
     current_price = float(df.iloc[-1]['close'])
+    if active_fvgs:
+        descriptions = [
+            (
+                f"{fvg.direction.value.lower()} fair value gap from "
+                f"{fvg.bottom} to {fvg.top}, midpoint {fvg.midpoint}, "
+                f"created at {fvg.creation_time}; status "
+                f"{fvg.status.value.lower()}."
+            )
+            for fvg in active_fvgs
+        ]
+        summary = " ".join(descriptions)
+    else:
+        summary = "No active fair value gaps were found."
     
     return {
+        "summary": summary,
         "current_price": current_price,
         "active_bullish_fvgs": [f for f in active_fvgs if f.direction == FVGDirection.BULLISH],
         "active_bearish_fvgs": [f for f in active_fvgs if f.direction == FVGDirection.BEARISH],

@@ -1,341 +1,597 @@
-"""
-Module: Simulator (Backtester Engine)
-Purpose: Loops through M5 data, reconstructs HTF without look-ahead, 
-applies volatility filters, and simulates trades.
-"""
+"""Chronological, single-symbol historical trade simulation."""
 
-import pandas as pd
-import numpy as np
-from dataclasses import dataclass, field
-from enum import Enum
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any
 import math
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-from strategies.base import BaseStrategy, Signal, SignalDirection
-from knowledge.conditions import run_pre_trade_check, PreTradeContext, StrategyConditions
-from knowledge.daily_bias import BiasDirection
+import numpy as np
+import pandas as pd
 
-# ==========================================
-# 1. ZERO LOOK-AHEAD AGGREGATOR (STOLEN FROM OLD BOT)
-# ==========================================
-class ZeroLookAheadAggregator:
-    def __init__(self, d1_history: pd.DataFrame, h4_history: pd.DataFrame, h1_history: pd.DataFrame):
-        self.d1_all = d1_history.copy()
-        self.h4_all = h4_history.copy()
-        self.h1_all = h1_history.copy()
+from broker.costs import calculate_round_trip_commission
+from broker.fill import market_fill_price
+from data.timeframes import TIMEFRAME_LENGTHS
+from engine.models import Direction, Signal, Trade
+from strategies.base import BarContext, Strategy
 
-        for df in [self.d1_all, self.h4_all, self.h1_all]:
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df['dt'] = pd.to_datetime(df['time'], utc=True)
-                df.set_index('dt', inplace=True)
-                df.sort_index(inplace=True)
 
-        self._d1_close_epochs = [int((t + pd.Timedelta(hours=24)).timestamp()) for t in self.d1_all.index]
-        self._h4_close_epochs = [int((t + pd.Timedelta(hours=4)).timestamp()) for t in self.h4_all.index]
-        self._h1_close_epochs = [int((t + pd.Timedelta(hours=1)).timestamp()) for t in self.h1_all.index]
-
-        self._d1_buffer = self._init_buffer(self.d1_all, 150)
-        self._h4_buffer = self._init_buffer(self.h4_all, 30)
-        self._h1_buffer = self._init_buffer(self.h1_all, 30)
-
-    def _init_buffer(self, source_df: pd.DataFrame, size: int) -> pd.DataFrame:
-        cols = ['time', 'open', 'high', 'low', 'close', 'volume']
-        sample = source_df[cols].tail(size).copy().reset_index(drop=True)
-        if len(sample) < size:
-            pad = pd.DataFrame(index=range(size - len(sample)), columns=cols)
-            sample = pd.concat([pad, sample], ignore_index=True)
-        return sample
-
-    def get_feeds_at_time(self, m5_history_up_to_t: pd.DataFrame, current_time_utc: datetime):
-        import bisect
-        curr_epoch = int(current_time_utc.timestamp())
-        m5_times = pd.to_datetime(m5_history_up_to_t['time'], utc=True)
-
-        # --- D1 ---
-        d1_idx = bisect.bisect_right(self._d1_close_epochs, curr_epoch)
-        last_d1_open_hour = self.d1_all.index[d1_idx - 1].hour if d1_idx > 0 else 21
-        d1_start = current_time_utc.replace(hour=last_d1_open_hour, minute=0, second=0, microsecond=0)
-        if current_time_utc < d1_start:
-            d1_start -= timedelta(days=1)
-        m5_today = m5_history_up_to_t[m5_times >= d1_start]
-        if not m5_today.empty:
-            self._d1_buffer.iloc[149] = [
-                d1_start.strftime("%Y-%m-%d %H:%M:%S"),
-                float(m5_today['open'].iloc[0]), float(m5_today['high'].max()),
-                float(m5_today['low'].min()), float(m5_today['close'].iloc[-1]),
-                int(m5_today['volume'].sum())
-            ]
-            active_d1 = self._d1_buffer
-        else:
-            active_d1 = self._d1_buffer.iloc[:149].reset_index(drop=True)
-
-        # --- H4 ---
-        h4_idx = bisect.bisect_right(self._h4_close_epochs, curr_epoch)
-        h4_start_hour = (current_time_utc.hour // 4) * 4
-        h4_start = current_time_utc.replace(hour=h4_start_hour, minute=0, second=0, microsecond=0)
-        m5_h4 = m5_history_up_to_t[m5_times >= h4_start]
-        if not m5_h4.empty:
-            self._h4_buffer.iloc[29] = [
-                h4_start.strftime("%Y-%m-%d %H:%M:%S"),
-                float(m5_h4['open'].iloc[0]), float(m5_h4['high'].max()),
-                float(m5_h4['low'].min()), float(m5_h4['close'].iloc[-1]),
-                int(m5_h4['volume'].sum())
-            ]
-            active_h4 = self._h4_buffer
-        else:
-            active_h4 = self._h4_buffer.iloc[:29].reset_index(drop=True)
-
-        # --- H1 ---
-        h1_idx = bisect.bisect_right(self._h1_close_epochs, curr_epoch)
-        h1_start = current_time_utc.replace(minute=0, second=0, microsecond=0)
-        m5_h1 = m5_history_up_to_t[m5_times >= h1_start]
-        if not m5_h1.empty:
-            self._h1_buffer.iloc[29] = [
-                h1_start.strftime("%Y-%m-%d %H:%M:%S"),
-                float(m5_h1['open'].iloc[0]), float(m5_h1['high'].max()),
-                float(m5_h1['low'].min()), float(m5_h1['close'].iloc[-1]),
-                int(m5_h1['volume'].sum())
-            ]
-            active_h1 = self._h1_buffer
-        else:
-            active_h1 = self._h1_buffer.iloc[:29].reset_index(drop=True)
-
-        return active_h1, active_h4, active_d1
-
-# ==========================================
-# 2. VOLATILITY ENGINE (STOLEN FROM OLD BOT)
-# ==========================================
-class VolatilityEngine:
-    def __init__(self):
-        self._vol_cache = {}
-    
-    def compute_symbol_volatility(self, d1_df, m5_df, current_quote, symbol, as_of=None):
-        # Simplified version for the new engine
-        if d1_df.empty or len(d1_df) < 120:
-            return {"valid": False, "reason": "Insufficient D1 history"}
-            
-        daily_ranges = (d1_df['high'] - d1_df['low']).dropna()
-        r_5 = daily_ranges.rolling(5).mean()
-        r_10 = daily_ranges.rolling(10).mean()
-        r_20 = daily_ranges.rolling(20).mean()
-        smoothed_series = ((0.50 * r_5) + (0.30 * r_10) + (0.20 * r_20)).dropna()
-        
-        current_adr = float(smoothed_series.iloc[-1])
-        
-        if current_adr == 0:
-            return {"valid": False, "reason": "Zero ADR"}
-            
-        return {
-            "valid": True,
-            "adr": current_adr,
-            "regime": "NORMAL" # Placeholder for now
-        }
-
-# ==========================================
-# 3. TRADE DATA STRUCTURES
-# ==========================================
-class TradeStatus(Enum):
-    OPEN = "OPEN"
-    CLOSED_TP = "CLOSED_TP"
-    CLOSED_SL = "CLOSED_SL"
-    CLOSED_EOD = "CLOSED_EOD"
-
-@dataclass
-class SimulatedTrade:
-    id: str
-    symbol: str
-    direction: SignalDirection
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    size_lots: float
-    entry_time: pd.Timestamp
-    setup_grade: str
-    strategy_name: str
-    reason: str
-    status: TradeStatus = TradeStatus.OPEN
-    exit_price: Optional[float] = None
-    exit_time: Optional[pd.Timestamp] = None
-    pnl: float = 0.0
-    r_multiple: float = 0.0
-
-@dataclass
+@dataclass(frozen=True)
 class BacktestConfig:
-    starting_balance: float = 100000.0
-    risk_per_trade_pct: float = 1.0
     pip_size: float = 0.0001
     pip_value_per_lot: float = 10.0
     spread_pips: float = 1.0
-    commission_per_lot: float = 7.0
+    slippage_pips: float = 0.0
+    commission_per_lot_per_side: float = 7.0
+    atr_period: int = 14
+    minimum_lots: float = 0.01
+    lot_step: float = 0.01
+
 
 @dataclass
 class BacktestResult:
-    config: BacktestConfig
-    trades: List[SimulatedTrade]
-    equity_curve: List[Dict[str, Any]]
-    total_trades: int
-    win_rate: float
-    profit_factor: float
+    starting_balance: float
+    final_balance: float
+    final_equity: float
     net_profit: float
-    max_drawdown: float
+    return_percent: float
+    total_trades: int
+    wins: int
+    losses: int
+    breakeven: int
+    win_rate: float
+    profit_factor: Optional[float]
+    max_drawdown_percent: float
     expectancy_r: float
+    trades: List[Trade]
+    equity_curve: List[Dict[str, Any]]
+    daily_equity: List[Dict[str, Any]]
+    skipped_signals: List[Dict[str, Any]]
+    assumptions: List[str]
 
-# ==========================================
-# 4. POSITION MANAGEMENT
-# ==========================================
-def _calculate_position_size(balance, risk_pct, entry, sl, config):
-    sl_distance_pips = abs(entry - sl) / config.pip_size
-    if sl_distance_pips == 0: return 0.01
-    risk_amount = balance * (risk_pct / 100)
-    risk_per_lot = sl_distance_pips * config.pip_value_per_lot
-    lots = risk_amount / risk_per_lot
-    return max(0.01, round(lots, 2))
 
-def _update_open_trades(open_trades, candle, config):
-    for trade in open_trades:
-        if trade.status != TradeStatus.OPEN: continue
-        
-        # Check SL
-        if trade.direction == SignalDirection.BUY and candle['low'] <= trade.stop_loss:
-            trade.status = TradeStatus.CLOSED_SL
-            trade.exit_price = trade.stop_loss
-            trade.exit_time = candle['time']
-        elif trade.direction == SignalDirection.SELL and candle['high'] >= trade.stop_loss:
-            trade.status = TradeStatus.CLOSED_SL
-            trade.exit_price = trade.stop_loss
-            trade.exit_time = candle['time']
-            
-        # Check TP
-        elif trade.direction == SignalDirection.BUY and candle['high'] >= trade.take_profit:
-            trade.status = TradeStatus.CLOSED_TP
-            trade.exit_price = trade.take_profit
-            trade.exit_time = candle['time']
-        elif trade.direction == SignalDirection.SELL and candle['low'] <= trade.take_profit:
-            trade.status = TradeStatus.CLOSED_TP
-            trade.exit_price = trade.take_profit
-            trade.exit_time = candle['time']
+class BacktestSimulator:
+    """Replays closed bars and fills signals at the next bar's open."""
 
-        # EOD Close (21:00 SAST = 19:00 UTC)
-        if trade.status == TradeStatus.OPEN and candle['time'].hour == 19 and candle['time'].minute == 0:
-            trade.status = TradeStatus.CLOSED_EOD
-            trade.exit_price = candle['close']
-            trade.exit_time = candle['time']
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        strategy: Strategy,
+        starting_balance: float,
+        risk_percent: float,
+        symbol: str = "EURUSD",
+        config: Optional[BacktestConfig] = None,
+    ) -> None:
+        if not math.isfinite(starting_balance) or starting_balance <= 0:
+            raise ValueError("starting_balance must be a positive finite number")
+        if not math.isfinite(risk_percent) or not 0 < risk_percent <= 100:
+            raise ValueError("risk_percent must be greater than 0 and no more than 100")
 
-        if trade.status in [TradeStatus.CLOSED_TP, TradeStatus.CLOSED_SL, TradeStatus.CLOSED_EOD]:
-            price_diff = trade.exit_price - trade.entry_price if trade.direction == SignalDirection.BUY else trade.entry_price - trade.exit_price
-            pips_gained = price_diff / config.pip_size
-            gross_pnl = pips_gained * config.pip_value_per_lot * trade.size_lots
-            commission = config.commission_per_lot * trade.size_lots * 2
-            trade.pnl = gross_pnl - commission
-            
-            initial_risk = abs(trade.entry_price - trade.stop_loss) / config.pip_size * config.pip_value_per_lot * trade.size_lots
-            trade.r_multiple = trade.pnl / initial_risk if initial_risk > 0 else 0
+        self.config = config or BacktestConfig()
+        self._validate_config(self.config)
+        self.df = self._normalize_candles(df)
+        self.strategy = strategy
+        self.symbol = symbol.upper()
+        self.timeframe = str(getattr(strategy, "timeframe", "")).upper()
+        if self.timeframe not in TIMEFRAME_LENGTHS:
+            raise ValueError(f"Unsupported strategy timeframe: {self.timeframe}")
 
-# ==========================================
-# 5. MAIN BACKTEST ENGINE
-# ==========================================
-def run_backtest(df_m5, df_h1, df_h4, df_d1, strategy, strategy_conditions, symbol, config=BacktestConfig()):
-    trades = []
-    equity_curve = []
-    current_balance = config.starting_balance
-    open_trades = []
-    
-    aggregator = ZeroLookAheadAggregator(df_d1, df_h4, df_h1)
-    vol_engine = VolatilityEngine()
-    
-    df_m5 = df_m5.sort_values('time').reset_index(drop=True)
-    
-    # Start at 120 to allow aggregator to warm up
-    for i in range(120, len(df_m5)):
-        current_candle = df_m5.iloc[i]
-        current_time = current_candle['time']
-        
-        # 1. Manage existing trades
-        _update_open_trades(open_trades, current_candle, config)
-        
-        # 2. Update balance
-        for t in open_trades:
-            if t.status != TradeStatus.OPEN:
-                current_balance += t.pnl
-        open_trades = [t for t in open_trades if t.status == TradeStatus.OPEN]
-        
-        # 3. Record Equity
-        floating_pnl = sum(
-            ((current_candle['close'] - t.entry_price) if t.direction == SignalDirection.BUY else (t.entry_price - current_candle['close'])) / config.pip_size * config.pip_value_per_lot * t.size_lots
-            for t in open_trades
-        )
-        equity_curve.append({"time": current_time, "equity": current_balance + floating_pnl})
-        
-        # 4. Reconstruct HTF (No Look-Ahead)
-        hist_m5 = df_m5.iloc[:i+1]
-        h1_view, h4_view, d1_view = aggregator.get_feeds_at_time(hist_m5, current_time.to_pydatetime())
-        
-        # 5. Compute Volatility
-        vol_metrics = vol_engine.compute_symbol_volatility(d1_view, hist_m5, current_candle['close'], symbol, current_time.to_pydatetime())
-        
-        # 6. Generate Signal
-        ctx = {
-            "df": hist_m5,
-            "daily_df": d1_view,
-            "h4_df": h4_view,
-            "current_time": current_time,
-            "symbol": symbol,
-            "spread_pips": config.spread_pips,
-            "vol_metrics": vol_metrics
+        supported_symbols = getattr(strategy, "symbols", None)
+        if supported_symbols and self.symbol not in [item.upper() for item in supported_symbols]:
+            raise ValueError(f"Strategy does not support {self.symbol}")
+
+        self.starting_balance = float(starting_balance)
+        self.risk_percent = float(risk_percent)
+        self.balance = self.starting_balance
+        self.equity = self.starting_balance
+        self.closed_trades: List[Trade] = []
+        self.open_trade: Optional[Trade] = None
+        self.equity_curve: List[Dict[str, Any]] = []
+        self.daily_equity: List[Dict[str, Any]] = []
+        self.skipped_signals: List[Dict[str, Any]] = []
+        self._atr_values = self._calculate_atr(self.df, self.config.atr_period)
+        self._has_run = False
+
+    @staticmethod
+    def _validate_config(config: BacktestConfig) -> None:
+        positive_values = {
+            "pip_size": config.pip_size,
+            "pip_value_per_lot": config.pip_value_per_lot,
+            "minimum_lots": config.minimum_lots,
+            "lot_step": config.lot_step,
         }
-        signal = strategy.evaluate_signal(ctx)
-        
-        if signal:
-            # 7. Volatility Filter (Stolen from old bot)
-            if vol_metrics.get("valid"):
-                sl_dist = abs(signal.entry_price - signal.stop_loss)
-                if sl_dist > (vol_metrics['adr'] * 0.5): # SL cannot be wider than 50% of ADR
-                    continue # Skip trade
-            
-            # 8. Checklist
-            pre_ctx = PreTradeContext(
-                df=hist_m5, daily_df=d1_view, time=current_time,
-                symbol=symbol, spread_pips=config.spread_pips,
-                intended_direction=BiasDirection.BULLISH if signal.direction == SignalDirection.BUY else BiasDirection.BEARISH
-            )
-            check = run_pre_trade_check(pre_ctx, strategy_conditions)
-            
-            if check["decision"] in ["TRADE", "REDUCE_SIZE"]:
-                risk_mult = 1.0 if check["decision"] == "TRADE" else 0.5
-                size = _calculate_position_size(current_balance, config.risk_per_trade_pct * risk_mult, signal.entry_price, signal.stop_loss, config)
-                
-                new_trade = SimulatedTrade(
-                    id=f"trd-{len(trades)}", symbol=symbol, direction=signal.direction,
-                    entry_price=signal.entry_price, stop_loss=signal.stop_loss,
-                    take_profit=signal.take_profit, size_lots=size,
-                    entry_time=current_time, setup_grade=signal.setup_grade,
-                    strategy_name=signal.strategy_name, reason=signal.reason
-                )
-                open_trades.append(new_trade)
-                trades.append(new_trade)
+        for name, value in positive_values.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive finite number")
 
-    # Final Stats
-    closed = [t for t in trades if t.status != TradeStatus.OPEN]
-    if not closed:
-        return BacktestResult(config, trades, equity_curve, 0, 0, 0, 0, 0, 0)
-        
-    wins = [t for t in closed if t.pnl > 0]
-    gross_profit = sum(t.pnl for t in wins)
-    gross_loss = abs(sum(t.pnl for t in closed if t.pnl <= 0))
-    
-    peak = -float('inf')
-    max_dd = 0.0
-    for p in equity_curve:
-        peak = max(peak, p['equity'])
-        max_dd = max(max_dd, (peak - p['equity']) / peak * 100)
-        
-    return BacktestResult(
-        config=config, trades=trades, equity_curve=equity_curve,
-        total_trades=len(closed),
-        win_rate=round(len(wins)/len(closed)*100, 2),
-        profit_factor=round(gross_profit/gross_loss, 2) if gross_loss > 0 else 99.9,
-        net_profit=round(gross_profit - gross_loss, 2),
-        max_drawdown=round(max_dd, 2),
-        expectancy_r=round(sum(t.r_multiple for t in closed)/len(closed), 2)
-    )
+        non_negative_values = {
+            "spread_pips": config.spread_pips,
+            "slippage_pips": config.slippage_pips,
+            "commission_per_lot_per_side": config.commission_per_lot_per_side,
+        }
+        for name, value in non_negative_values.items():
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite non-negative number")
+        if config.atr_period < 1:
+            raise ValueError("atr_period must be at least 1")
+
+    @staticmethod
+    def _normalize_candles(df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            raise ValueError("Candle data must be a non-empty DataFrame")
+
+        candles = df.copy()
+        if "time" not in candles.columns and "timestamp" in candles.columns:
+            candles = candles.rename(columns={"timestamp": "time"})
+
+        required_columns = ["time", "open", "high", "low", "close"]
+        missing_columns = [name for name in required_columns if name not in candles.columns]
+        if missing_columns:
+            raise ValueError(f"Missing candle columns: {', '.join(missing_columns)}")
+
+        candles["time"] = pd.to_datetime(candles["time"], utc=True, errors="coerce")
+        if candles["time"].isna().any():
+            raise ValueError("Candle times must all be valid UTC timestamps")
+
+        for name in ["open", "high", "low", "close"]:
+            candles[name] = pd.to_numeric(candles[name], errors="coerce")
+        price_values = candles[["open", "high", "low", "close"]].to_numpy(dtype=float)
+        if not np.isfinite(price_values).all():
+            raise ValueError("Candle prices must all be finite numbers")
+        if (price_values <= 0).any():
+            raise ValueError("Candle prices must be positive")
+
+        candles = candles.sort_values("time").reset_index(drop=True)
+        if candles["time"].duplicated().any():
+            raise ValueError("Candle timestamps must be unique")
+        if (
+            (candles["high"] < candles["low"]).any()
+            or (candles["high"] < candles["open"]).any()
+            or (candles["high"] < candles["close"]).any()
+            or (candles["low"] > candles["open"]).any()
+            or (candles["low"] > candles["close"]).any()
+        ):
+            raise ValueError("Candle high and low values do not contain open and close")
+
+        return candles
+
+    @staticmethod
+    def _calculate_atr(candles: pd.DataFrame, period: int) -> pd.Series:
+        previous_close = candles["close"].shift(1)
+        true_range = pd.concat(
+            [
+                candles["high"] - candles["low"],
+                (candles["high"] - previous_close).abs(),
+                (candles["low"] - previous_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        return true_range.rolling(window=period, min_periods=period).mean()
+
+    def _record_skipped_signal(self, signal: Signal, signal_time: datetime, reason: str) -> None:
+        self.skipped_signals.append(
+            {
+                "signal_time": signal_time,
+                "direction": signal.direction.value,
+                "reason": reason,
+            }
+        )
+
+    def _open_position(
+        self,
+        signal: Signal,
+        atr: float,
+        signal_time: datetime,
+        entry_bar: pd.Series,
+    ) -> Optional[Trade]:
+        if self.open_trade is not None:
+            self._record_skipped_signal(signal, signal_time, "position_already_open")
+            return None
+        if not math.isfinite(atr) or atr <= 0:
+            self._record_skipped_signal(signal, signal_time, "atr_not_ready")
+            return None
+        if self.config.spread_pips > signal.max_spread_pips:
+            self._record_skipped_signal(signal, signal_time, "spread_above_strategy_limit")
+            return None
+        if signal.sl_atr_multiple <= 0 or signal.tp_atr_multiple <= 0:
+            self._record_skipped_signal(signal, signal_time, "invalid_atr_multiple")
+            return None
+
+        entry_mid = float(entry_bar["open"])
+        direction = signal.direction
+        entry_side = direction
+        entry_price = market_fill_price(
+            entry_mid,
+            entry_side,
+            self.config.pip_size,
+            self.config.spread_pips,
+            self.config.slippage_pips,
+        )
+        stop_distance = atr * signal.sl_atr_multiple
+        target_distance = atr * signal.tp_atr_multiple
+
+        if direction == Direction.BUY:
+            stop_loss = entry_mid - stop_distance
+            take_profit = entry_mid + target_distance
+        elif direction == Direction.SELL:
+            stop_loss = entry_mid + stop_distance
+            take_profit = entry_mid - target_distance
+        else:
+            raise ValueError(f"Unsupported signal direction: {direction}")
+
+        if stop_loss <= 0 or take_profit <= 0:
+            self._record_skipped_signal(signal, signal_time, "invalid_stop_or_target")
+            return None
+
+        round_trip_cost_per_lot = (
+            (self.config.spread_pips / 2 + 2 * self.config.slippage_pips)
+            * self.config.pip_value_per_lot
+            + calculate_round_trip_commission(
+                1.0,
+                self.config.commission_per_lot_per_side,
+            )
+        )
+        stop_risk_per_lot = (
+            stop_distance / self.config.pip_size * self.config.pip_value_per_lot
+            + round_trip_cost_per_lot
+        )
+        risk_cash = self.equity * self.risk_percent / 100
+        raw_lots = risk_cash / stop_risk_per_lot
+        lots = math.floor(raw_lots / self.config.lot_step + 1e-12) * self.config.lot_step
+        lots = round(lots, 8)
+        if lots < self.config.minimum_lots:
+            self._record_skipped_signal(signal, signal_time, "minimum_lot_exceeds_risk_budget")
+            return None
+
+        risk_cash = lots * stop_risk_per_lot
+        trade = Trade(
+            id=f"trd-{len(self.closed_trades)}",
+            symbol=self.symbol,
+            direction=direction,
+            entry_time=entry_bar["time"].to_pydatetime(),
+            entry_price=entry_price,
+            size_lots=lots,
+            sl_price=stop_loss,
+            tp_price=take_profit,
+            signal_time=signal_time,
+            entry_mid_price=entry_mid,
+            risk_cash=risk_cash,
+        )
+        self.open_trade = trade
+        return trade
+
+    def _exit_for_bar(
+        self,
+        trade: Trade,
+        candle: pd.Series,
+    ) -> Optional[Tuple[float, str, datetime]]:
+        half_spread = self.config.spread_pips * self.config.pip_size / 2
+        bar_open = float(candle["open"])
+        bar_high = float(candle["high"])
+        bar_low = float(candle["low"])
+        bar_time = candle["time"].to_pydatetime()
+        bar_close_time = bar_time + TIMEFRAME_LENGTHS[self.timeframe]
+
+        if trade.direction == Direction.BUY:
+            open_quote = bar_open - half_spread
+            high_quote = bar_high - half_spread
+            low_quote = bar_low - half_spread
+            stop_hit_at_open = open_quote <= trade.sl_price
+            target_hit_at_open = open_quote >= trade.tp_price
+            stop_hit = low_quote <= trade.sl_price
+            target_hit = high_quote >= trade.tp_price
+            quote_to_mid = half_spread
+        else:
+            open_quote = bar_open + half_spread
+            high_quote = bar_high + half_spread
+            low_quote = bar_low + half_spread
+            stop_hit_at_open = open_quote >= trade.sl_price
+            target_hit_at_open = open_quote <= trade.tp_price
+            stop_hit = high_quote >= trade.sl_price
+            target_hit = low_quote <= trade.tp_price
+            quote_to_mid = -half_spread
+
+        if stop_hit_at_open:
+            return bar_open, "stop_loss_gap", bar_time
+        if target_hit_at_open:
+            return bar_open, "take_profit_gap", bar_time
+        if stop_hit and target_hit:
+            trigger_quote = trade.sl_price
+            reason = "stop_loss_both_touched"
+        elif stop_hit:
+            trigger_quote = trade.sl_price
+            reason = "stop_loss"
+        elif target_hit:
+            trigger_quote = trade.tp_price
+            reason = "take_profit"
+        else:
+            return None
+
+        return trigger_quote + quote_to_mid, reason, bar_close_time
+
+    def _close_position(
+        self,
+        trade: Trade,
+        exit_mid: float,
+        exit_time: datetime,
+        reason: str,
+    ) -> None:
+        exit_side = Direction.SELL if trade.direction == Direction.BUY else Direction.BUY
+        trade.exit_mid_price = exit_mid
+        trade.exit_price = market_fill_price(
+            exit_mid,
+            exit_side,
+            self.config.pip_size,
+            self.config.spread_pips,
+            self.config.slippage_pips,
+        )
+        trade.exit_time = exit_time
+
+        direction_sign = 1.0 if trade.direction == Direction.BUY else -1.0
+        trade.gross_pnl = (
+            direction_sign
+            * (exit_mid - trade.entry_mid_price)
+            / self.config.pip_size
+            * self.config.pip_value_per_lot
+            * trade.size_lots
+        )
+        trade.spread_cost = (
+            self.config.spread_pips
+            * self.config.pip_value_per_lot
+            * trade.size_lots
+        )
+        trade.slippage_cost = (
+            2
+            * self.config.slippage_pips
+            * self.config.pip_value_per_lot
+            * trade.size_lots
+        )
+        trade.commission = calculate_round_trip_commission(
+            trade.size_lots,
+            self.config.commission_per_lot_per_side,
+        )
+        trade.pnl = (
+            trade.gross_pnl
+            - trade.spread_cost
+            - trade.slippage_cost
+            - trade.commission
+        )
+        trade.r_multiple = trade.pnl / trade.risk_cash if trade.risk_cash > 0 else 0.0
+        trade.exit_reason = reason
+
+        self.balance += trade.pnl
+        self.equity = self.balance
+        self.closed_trades.append(trade)
+        self.open_trade = None
+
+    def _unrealized_pnl(self, close_mid: float) -> float:
+        trade = self.open_trade
+        if trade is None:
+            return 0.0
+
+        direction_sign = 1.0 if trade.direction == Direction.BUY else -1.0
+        gross_pnl = (
+            direction_sign
+            * (close_mid - trade.entry_mid_price)
+            / self.config.pip_size
+            * self.config.pip_value_per_lot
+            * trade.size_lots
+        )
+        spread_cost = (
+            self.config.spread_pips
+            * self.config.pip_value_per_lot
+            * trade.size_lots
+        )
+        slippage_cost = (
+            2
+            * self.config.slippage_pips
+            * self.config.pip_value_per_lot
+            * trade.size_lots
+        )
+        commission = calculate_round_trip_commission(
+            trade.size_lots,
+            self.config.commission_per_lot_per_side,
+        )
+        return gross_pnl - spread_cost - slippage_cost - commission
+
+    def _record_equity(self, timestamp: datetime, close_mid: float) -> None:
+        unrealized_pnl = self._unrealized_pnl(close_mid)
+        self.equity = self.balance + unrealized_pnl
+        previous_peak = max(
+            (point["equity"] for point in self.equity_curve),
+            default=self.starting_balance,
+        )
+        peak = max(previous_peak, self.equity)
+        drawdown_percent = (
+            (peak - self.equity) / peak * 100
+            if peak > 0
+            else 0.0
+        )
+        self.equity_curve.append(
+            {
+                "time": timestamp,
+                "balance": self.balance,
+                "equity": self.equity,
+                "unrealized_pnl": unrealized_pnl,
+                "return_percent": (self.equity / self.starting_balance - 1) * 100,
+                "drawdown_percent": drawdown_percent,
+            }
+        )
+
+    def _build_daily_equity(self) -> List[Dict[str, Any]]:
+        by_day: Dict[str, List[Dict[str, Any]]] = {}
+        for point in self.equity_curve:
+            day = point["time"].date().isoformat()
+            by_day.setdefault(day, []).append(point)
+
+        daily = []
+        for day, points in sorted(by_day.items()):
+            opening_equity = points[0]["equity"]
+            closing_equity = points[-1]["equity"]
+            daily.append(
+                {
+                    "date": day,
+                    "open_equity": opening_equity,
+                    "close_equity": closing_equity,
+                    "pnl": closing_equity - opening_equity,
+                    "return_percent": (
+                        (closing_equity / opening_equity - 1) * 100
+                        if opening_equity > 0
+                        else 0.0
+                    ),
+                }
+            )
+        return daily
+
+    def run(self) -> BacktestResult:
+        if self._has_run:
+            raise RuntimeError("A BacktestSimulator instance can only run once")
+        self._has_run = True
+
+        first_time = self.df.iloc[0]["time"].to_pydatetime()
+        self.equity_curve.append(
+            {
+                "time": first_time,
+                "balance": self.balance,
+                "equity": self.equity,
+                "unrealized_pnl": 0.0,
+                "return_percent": 0.0,
+                "drawdown_percent": 0.0,
+            }
+        )
+
+        pending_signal: Optional[Tuple[Signal, float, datetime]] = None
+        for index, candle in self.df.iterrows():
+            candle_time = candle["time"].to_pydatetime()
+            candle_close_time = candle_time + TIMEFRAME_LENGTHS[self.timeframe]
+            opened_this_bar = False
+
+            if self.open_trade is not None:
+                exit_event = self._exit_for_bar(self.open_trade, candle)
+                if exit_event is not None:
+                    exit_mid, reason, exit_time = exit_event
+                    self._close_position(self.open_trade, exit_mid, exit_time, reason)
+
+            if pending_signal is not None:
+                signal, atr, signal_time = pending_signal
+                if self.open_trade is None and self.equity > 0:
+                    opened_this_bar = self._open_position(
+                        signal,
+                        atr,
+                        signal_time,
+                        candle,
+                    ) is not None
+                elif self.equity <= 0:
+                    self._record_skipped_signal(signal, signal_time, "non_positive_equity")
+                else:
+                    self._record_skipped_signal(signal, signal_time, "position_already_open")
+                pending_signal = None
+
+            if opened_this_bar and self.open_trade is not None:
+                exit_event = self._exit_for_bar(self.open_trade, candle)
+                if exit_event is not None:
+                    exit_mid, reason, exit_time = exit_event
+                    self._close_position(self.open_trade, exit_mid, exit_time, reason)
+
+            if index == len(self.df) - 1 and self.open_trade is not None:
+                self._close_position(
+                    self.open_trade,
+                    float(candle["close"]),
+                    candle_close_time,
+                    "end_of_data",
+                )
+
+            self._record_equity(candle_close_time, float(candle["close"]))
+
+            context = BarContext(
+                df=self.df.iloc[: index + 1].copy(),
+                current_time=candle_close_time,
+                symbol=self.symbol,
+            )
+            signal = self.strategy.on_bar(context)
+            if signal is None:
+                continue
+            if not isinstance(signal, Signal):
+                raise TypeError("Strategies must return engine.models.Signal or None")
+            if not isinstance(signal.direction, Direction):
+                raise TypeError("Signal direction must be a Direction")
+            signal_values = (
+                signal.sl_atr_multiple,
+                signal.tp_atr_multiple,
+                signal.max_spread_pips,
+            )
+            if not all(math.isfinite(value) for value in signal_values):
+                raise ValueError("Signal values must all be finite numbers")
+            if signal.max_spread_pips < 0:
+                raise ValueError("Signal max_spread_pips must be non-negative")
+            if index == len(self.df) - 1:
+                self._record_skipped_signal(signal, candle_close_time, "no_next_bar_for_entry")
+                continue
+            if self.open_trade is not None:
+                self._record_skipped_signal(signal, candle_close_time, "position_already_open")
+                continue
+
+            atr = float(self._atr_values.iloc[index])
+            if not math.isfinite(atr) or atr <= 0:
+                self._record_skipped_signal(signal, candle_close_time, "atr_not_ready")
+                continue
+            pending_signal = (signal, atr, candle_close_time)
+
+        self.daily_equity = self._build_daily_equity()
+        return self._build_result()
+
+    def _build_result(self) -> BacktestResult:
+        wins = [trade for trade in self.closed_trades if trade.pnl > 0]
+        losses = [trade for trade in self.closed_trades if trade.pnl < 0]
+        breakeven = len(self.closed_trades) - len(wins) - len(losses)
+        gross_profit = sum(trade.pnl for trade in wins)
+        gross_loss = abs(sum(trade.pnl for trade in losses))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+        max_drawdown_percent = max(
+            (point["drawdown_percent"] for point in self.equity_curve),
+            default=0.0,
+        )
+        expectancy_r = (
+            sum(trade.r_multiple for trade in self.closed_trades) / len(self.closed_trades)
+            if self.closed_trades
+            else 0.0
+        )
+        net_profit = self.balance - self.starting_balance
+
+        return BacktestResult(
+            starting_balance=self.starting_balance,
+            final_balance=self.balance,
+            final_equity=self.equity,
+            net_profit=net_profit,
+            return_percent=(self.equity / self.starting_balance - 1) * 100,
+            total_trades=len(self.closed_trades),
+            wins=len(wins),
+            losses=len(losses),
+            breakeven=breakeven,
+            win_rate=len(wins) / len(self.closed_trades) * 100 if self.closed_trades else 0.0,
+            profit_factor=profit_factor,
+            max_drawdown_percent=max_drawdown_percent,
+            expectancy_r=expectancy_r,
+            trades=list(self.closed_trades),
+            equity_curve=list(self.equity_curve),
+            daily_equity=list(self.daily_equity),
+            skipped_signals=list(self.skipped_signals),
+            assumptions=[
+                f"Risk: {self.risk_percent:g}% of current equity per trade.",
+                (
+                    "Data range: "
+                    f"{self.df.iloc[0]['time'].isoformat()} through "
+                    f"{self.df.iloc[-1]['time'].isoformat()} "
+                    f"({(self.df.iloc[-1]['time'] - self.df.iloc[0]['time']).days} days)."
+                ),
+                f"Spread: fixed at {self.config.spread_pips:g} pips.",
+                f"Commission: ${self.config.commission_per_lot_per_side:g} per lot per side.",
+                f"Slippage: fixed at {self.config.slippage_pips:g} pips per fill.",
+                "Overnight swap is not modeled.",
+                "Only one position is open at a time.",
+                "When a bar touches both stop loss and take profit, stop loss is counted first.",
+                "Signals use closed bars and enter at the next bar's open.",
+                "Price gaps can cause stop losses to exceed the configured risk amount.",
+                "Margin and leverage limits are not modeled.",
+                "Market-condition analysis, setup grades, MAE/MFE, optimization, and robustness tests are not implemented.",
+            ],
+        )

@@ -2,6 +2,8 @@
 
 Python scraper for the [Forex Factory](https://www.forexfactory.com/calendar) economic calendar. Pulls monthly events into structured CSV/JSON, filters by currency and impact, converts timezones, and fires configurable pre-event alerts to Discord, Telegram, or any HTTP webhook.
 
+The control center links to the free Forex Factory calendar website. It does not import events from that site because no official free API or permission for automated access has been verified. The scraper in this toolkit is a separate existing tool and is not connected to the main app; use it only in accordance with Forex Factory's terms.
+
 ## Features
 
 - Scrapes the full FF economic calendar — currency, impact, time, event name, detail URL
@@ -157,6 +159,8 @@ Set `schedule_preset` in `config.yaml`:
 | `hourly` | `0 * * * *` |
 
 Use a custom cron expression instead of a preset via the `CRON_SCHEDULE` or `ALERT_CRON_SCHEDULE` env variables.
+
+The project configuration refreshes the current calendar month hourly and stores times in Asia/Karachi; the knowledge report converts events to UTC. The alert checker remains scheduled every minute. These schedules require the scraper and alert containers to be running and do not guarantee that the external calendar site is always reachable.
 
 ---
 

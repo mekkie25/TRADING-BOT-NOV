@@ -7,6 +7,10 @@ class Direction(Enum):
     BUY = "BUY"
     SELL = "SELL"
 
+class PositionSide(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+
 @dataclass
 class Signal:
     direction: Direction
@@ -30,10 +34,25 @@ class Trade:
     pnl: float = 0.0
     r_multiple: float = 0.0
     exit_reason: str = "" 
+    signal_time: Optional[datetime] = None
+    entry_mid_price: float = 0.0
+    exit_mid_price: Optional[float] = None
+    gross_pnl: float = 0.0
+    spread_cost: float = 0.0
+    slippage_cost: float = 0.0
+    commission: float = 0.0
+    risk_cash: float = 0.0
     
     max_adverse_excursion: float = 0.0
     max_favorable_excursion: float = 0.0
     conditions: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def position_side(self) -> PositionSide:
+        """Describe this trade's position side, not the market's direction."""
+        if self.direction == Direction.BUY:
+            return PositionSide.LONG
+        return PositionSide.SHORT
 
 @dataclass
 class AccountState:

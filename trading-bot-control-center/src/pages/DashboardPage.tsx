@@ -33,6 +33,7 @@ import { useAppContext } from '../components/AppContext';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { GradeBadge } from '../components/GradeBadge';
 import { ErrorState, PanelShell } from '../components/DataState';
+import { LiveMarketDataPanel } from '../components/LiveMarketDataPanel';
 import {
   convertCurrencyAmount,
   formatCurrency,
@@ -377,6 +378,8 @@ export function DashboardPage() {
           </button>
         </div>
       </div>
+
+      <LiveMarketDataPanel />
 
       {/* KPI Cards Grid */}
       {accountLoading ? (

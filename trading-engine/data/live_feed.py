@@ -1,125 +1,589 @@
-"""
-Module: Live cTrader Data Feed
-Purpose: Connects to cTrader Open API, authenticates, subscribes to live spots and M5 trendbars.
-"""
+"""Data-only cTrader feed for quotes and completed M5 candles."""
 
+import logging
 import os
-import pandas as pd
-from datetime import datetime, timezone
-from typing import Callable, Dict, Any, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Optional, Set
+
 from dotenv import load_dotenv
 
-# Import cTrader SDK components
-from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
-from ctrader_open_api.messages.OpenApiMessages_pb2 import *
-from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
+from ctrader_open_api import Client, EndPoints, Protobuf, TcpProtocol
+from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+    ProtoOAAccountAuthReq,
+    ProtoOAAccountAuthRes,
+    ProtoOAApplicationAuthReq,
+    ProtoOAApplicationAuthRes,
+    ProtoOAErrorRes,
+    ProtoOAGetPositionUnrealizedPnLReq,
+    ProtoOAGetPositionUnrealizedPnLRes,
+    ProtoOASpotEvent,
+    ProtoOASubscribeLiveTrendbarReq,
+    ProtoOASubscribeLiveTrendbarRes,
+    ProtoOASubscribeSpotsReq,
+    ProtoOASubscribeSpotsRes,
+    ProtoOASymbolByIdReq,
+    ProtoOASymbolByIdRes,
+    ProtoOASymbolChangedEvent,
+    ProtoOASymbolsListReq,
+    ProtoOASymbolsListRes,
+    ProtoOATraderReq,
+    ProtoOATraderRes,
+)
+from ctrader_open_api.messages.OpenApiModelMessages_pb2 import ProtoOATrendbarPeriod
 from twisted.internet import reactor
+from twisted.internet.task import LoopingCall
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+CTRADER_PRICE_SCALE = 100_000
+ACCOUNT_FACTS_REFRESH_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class LiveQuote:
+    symbol: str
+    time: datetime
+    bid: float
+    ask: float
+
+
+@dataclass(frozen=True)
+class Candle:
+    symbol: str
+    timeframe: str
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+
+@dataclass(frozen=True)
+class AccountFacts:
+    account_id: int
+    observed_at: datetime
+    balance_received_at: datetime
+    unrealized_pnl_received_at: datetime
+    balance: float
+    net_unrealized_pnl: float
+    equity: float
+    leverage: Optional[float]
+    deposit_asset_id: int
+    equity_calculation: str
+    equity_note: str
+
+
+@dataclass(frozen=True)
+class BrokerSymbolInfo:
+    symbol: str
+    symbol_id: int
+    base_asset_id: int
+    quote_asset_id: int
+    digits: int
+    pip_position: int
+    lot_size_cents: int
+    minimum_volume_cents: int
+    volume_step_cents: int
+    maximum_volume_cents: int
+    maximum_exposure_cents: Optional[int] = None
+
+
+QuoteCallback = Callable[[LiveQuote], None]
+CandleCallback = Callable[[Candle], None]
+AccountCallback = Callable[[AccountFacts], None]
+SymbolInfoCallback = Callable[[Optional[BrokerSymbolInfo]], None]
+StatusCallback = Callable[[str, str], None]
+
+
 class LiveCTraderFeed:
-    def __init__(self, symbol_name: str = "EURUSD"):
-        self.client_id = os.getenv("CTRADER_CLIENT_ID")
-        self.client_secret = os.getenv("CTRADER_CLIENT_SECRET")
-        self.access_token = os.getenv("CTRADER_ACCESS_TOKEN")
-        self.account_id = int(os.getenv("CTRADER_ACCOUNT_ID", "0"))
-        self.env = os.getenv("CTRADER_ENV", "demo").lower()
-        self.symbol_name = symbol_name
-        
+    def __init__(
+        self,
+        symbol_name: str = "EURUSD",
+        on_quote: Optional[QuoteCallback] = None,
+        on_closed_candle: Optional[CandleCallback] = None,
+        on_account_facts: Optional[AccountCallback] = None,
+        on_symbol_info: Optional[SymbolInfoCallback] = None,
+        on_status: Optional[StatusCallback] = None,
+    ):
+        self.client_id = self._required_environment_value("CTRADER_CLIENT_ID")
+        self.client_secret = self._required_environment_value("CTRADER_SECRET")
+        self.access_token = self._required_environment_value("CTRADER_ACCESS_TOKEN")
+        self.account_id = self._read_account_id()
+
+        self.env = os.getenv("CTRADER_ENV", "demo").strip().lower()
+        if self.env not in ("demo", "live"):
+            raise ValueError("CTRADER_ENV must be either 'demo' or 'live'.")
+        if not symbol_name.strip():
+            raise ValueError("symbol_name must not be empty.")
+
+        self.symbol_name = symbol_name.strip()
         self.symbol_id: Optional[int] = None
-        
-        # Determine host based on env
-        if self.env == "demo":
-            host = EndPoints.PROTOBUF_DEMO_HOST
-        else:
-            host = EndPoints.PROTOBUF_LIVE_HOST
-            
+        self.connection_state = "disconnected"
+        self.on_quote = on_quote
+        self.on_closed_candle = on_closed_candle
+        self.on_account_facts = on_account_facts
+        self.on_symbol_info = on_symbol_info
+        self.on_status = on_status
+        self._latest_bid: Optional[float] = None
+        self._latest_ask: Optional[float] = None
+        self._active_m5_candle: Optional[Candle] = None
+        self._confirmed_subscriptions: Set[int] = set()
+        self._base_asset_id: Optional[int] = None
+        self._quote_asset_id: Optional[int] = None
+        self._account_refresh: Optional[LoopingCall] = None
+        self._pending_account_responses: Set[str] = set()
+        self._account_balance: Optional[float] = None
+        self._account_leverage: Optional[float] = None
+        self._account_deposit_asset_id: Optional[int] = None
+        self._account_balance_received_at: Optional[datetime] = None
+        self._account_net_unrealized_pnl: Optional[float] = None
+        self._account_pnl_received_at: Optional[datetime] = None
+
+        host = (
+            EndPoints.PROTOBUF_DEMO_HOST
+            if self.env == "demo"
+            else EndPoints.PROTOBUF_LIVE_HOST
+        )
         self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
         self.client.setConnectedCallback(self._on_connected)
         self.client.setDisconnectedCallback(self._on_disconnected)
         self.client.setMessageReceivedCallback(self._on_message)
 
-    def _on_connected(self, client):
-        print(f"[+] Connected to cTrader ({self.env.upper()}). Authenticating App...")
-        req = ProtoOAApplicationAuthReq()
-        req.clientId = self.client_id
-        req.clientSecret = self.client_secret
-        client.send(req)
+    @staticmethod
+    def _required_environment_value(name: str) -> str:
+        value = os.getenv(name)
+        if value is None or not value.strip():
+            raise ValueError(f"{name} must be set.")
+        return value.strip()
 
-    def _on_disconnected(self, client, reason):
-        print(f"[-] Disconnected: {reason}")
+    @classmethod
+    def _read_account_id(cls) -> int:
+        value = cls._required_environment_value("CTRADER_ACCOUNT_ID")
+        try:
+            account_id = int(value)
+        except ValueError:
+            raise ValueError("CTRADER_ACCOUNT_ID must be an integer.") from None
+        if account_id <= 0:
+            raise ValueError("CTRADER_ACCOUNT_ID must be greater than zero.")
+        return account_id
 
-    def _on_message(self, client, message):
-        msg_type = message.payloadType
-        
-        # --- Application Auth Success ---
-        if msg_type == ProtoOAApplicationAuthRes().payloadType:
-            print("[+] App Authenticated. Authenticating Account...")
-            req = ProtoOAAccountAuthReq()
-            req.ctidTraderAccountId = self.account_id
-            req.accessToken = self.access_token
-            client.send(req)
-            
-        # --- Account Auth Success ---
-        elif msg_type == ProtoOAAccountAuthRes().payloadType:
-            print("[+] Account Authenticated. Finding Symbol ID...")
-            req = ProtoOASymbolsListReq()
-            req.ctidTraderAccountId = self.account_id
-            client.send(req)
-            
-        # --- Symbols List Received ---
-        elif msg_type == ProtoOASymbolsListRes().payloadType:
-            for sym in message.symbol:
-                if sym.symbolName == self.symbol_name:
-                    self.symbol_id = sym.symbolId
-                    print(f"[+] Found {self.symbol_name} (ID: {self.symbol_id})")
-                    self._subscribe(client)
-                    break
-                    
-        # --- Live Spot Event (Contains Tick Data & Trendbar Updates) ---
-        elif msg_type == ProtoOASpotEvent().payloadType:
-            if message.symbolId != self.symbol_id:
-                return
-                
-            # 1. Print the live Bid price (raw is divided by 100000)
-            if message.HasField("bid"):
-                bid = message.bid / 100000.0
-                
-            # 2. Check for candle updates
-            if message.HasField("trendbar"):
-                tb = message.trendbar[0]
-                if tb.period == ProtoOATrendbarPeriod.M5:
-                    # Decode candle prices using the low + delta method
-                    digits = 5
-                    divisor = 10 ** digits
-                    low = tb.low / divisor
-                    high = (tb.low + tb.deltaHigh) / divisor
-                    close = (tb.low + tb.deltaClose) / divisor
-                    
-                    bar_time = datetime.fromtimestamp(tb.utcTimestampInMinutes * 60, tz=timezone.utc)
-                    
-                    print(f"[M5 UPDATE] {bar_time.strftime('%H:%M')} | "
-                          f"H: {high:.5f} | L: {low:.5f} | C: {close:.5f}")
+    def _set_connection_state(self, state: str, message: str) -> None:
+        self.connection_state = state
+        level = logging.ERROR if state == "error" else logging.INFO
+        logger.log(level, message)
+        if self.on_status is not None:
+            self.on_status(state, message)
 
-    def _subscribe(self, client):
-        # Subscribe to Spots (Required for Trendbars to flow)
-        req_spots = ProtoOASubscribeSpotsReq()
-        req_spots.ctidTraderAccountId = self.account_id
-        req_spots.symbolId.append(self.symbol_id)
-        client.send(req_spots)
-        print("[+] Subscribed to live Spots.")
-        
-        # Subscribe to Live M5 Trendbars
-        req_bars = ProtoOASubscribeLiveTrendbarReq()
-        req_bars.ctidTraderAccountId = self.account_id
-        req_bars.symbolId = self.symbol_id
-        req_bars.period = ProtoOATrendbarPeriod.M5
-        client.send(req_bars)
-        print("[+] Subscribed to live M5 Trendbars.")
-        print("\n[*] Waiting for live market data...\n" + "-"*40)
+    def _report_data_error(self, message: str) -> None:
+        logger.error(message)
+        if self.on_status is not None:
+            self.on_status("warning", message)
 
-    def start(self):
-        print(f"[*] Starting Live Feed for {self.symbol_name}...")
+    def _on_connected(self, client) -> None:
+        self._set_connection_state("connected", "Connected to cTrader.")
+        request = ProtoOAApplicationAuthReq()
+        request.clientId = self.client_id
+        request.clientSecret = self.client_secret
+        client.send(request)
+
+    def _on_disconnected(self, _, reason) -> None:
+        if self._account_refresh is not None and self._account_refresh.running:
+            self._account_refresh.stop()
+        self._latest_bid = None
+        self._latest_ask = None
+        self._active_m5_candle = None
+        self._confirmed_subscriptions.clear()
+        self._pending_account_responses.clear()
+        self._set_connection_state("disconnected", f"Disconnected from cTrader: {reason}")
+
+    def _on_message(self, client, message) -> None:
+        payload_type = message.payloadType
+
+        if payload_type == ProtoOAErrorRes().payloadType:
+            error = Protobuf.extract(message)
+            description = error.description or "cTrader returned an unspecified error."
+            self._set_connection_state("error", f"cTrader error: {description}")
+            client.stopService()
+        elif payload_type == ProtoOAApplicationAuthRes().payloadType:
+            request = ProtoOAAccountAuthReq()
+            request.ctidTraderAccountId = self.account_id
+            request.accessToken = self.access_token
+            client.send(request)
+            self._set_connection_state("authenticated", "Application authenticated.")
+        elif payload_type == ProtoOAAccountAuthRes().payloadType:
+            request = ProtoOASymbolsListReq()
+            request.ctidTraderAccountId = self.account_id
+            client.send(request)
+            self._request_account_facts()
+            self._account_refresh = LoopingCall(self._request_account_facts)
+            self._account_refresh.start(ACCOUNT_FACTS_REFRESH_SECONDS, now=False)
+            self._set_connection_state("authenticated", "Account authenticated.")
+        elif payload_type == ProtoOATraderRes().payloadType:
+            self._on_trader_response(Protobuf.extract(message))
+        elif payload_type == ProtoOAGetPositionUnrealizedPnLRes().payloadType:
+            self._on_position_pnl_response(Protobuf.extract(message))
+        elif payload_type == ProtoOASymbolsListRes().payloadType:
+            self._on_symbols_list(client, Protobuf.extract(message))
+        elif payload_type == ProtoOASymbolByIdRes().payloadType:
+            self._on_symbol_details(Protobuf.extract(message))
+        elif payload_type == ProtoOASymbolChangedEvent().payloadType:
+            self._on_symbol_changed(client, Protobuf.extract(message))
+        elif payload_type == ProtoOASpotEvent().payloadType:
+            self._on_spot_event(Protobuf.extract(message))
+        elif payload_type in (
+            ProtoOASubscribeSpotsRes().payloadType,
+            ProtoOASubscribeLiveTrendbarRes().payloadType,
+        ):
+            self._on_subscription_confirmed(payload_type)
+
+    def _request_account_facts(self) -> None:
+        if self._pending_account_responses:
+            return
+
+        self._account_balance = None
+        self._account_leverage = None
+        self._account_deposit_asset_id = None
+        self._account_balance_received_at = None
+        self._account_net_unrealized_pnl = None
+        self._account_pnl_received_at = None
+        self._pending_account_responses = {"trader", "position_pnl"}
+
+        trader_request = ProtoOATraderReq()
+        trader_request.ctidTraderAccountId = self.account_id
+        self.client.send(trader_request)
+
+        pnl_request = ProtoOAGetPositionUnrealizedPnLReq()
+        pnl_request.ctidTraderAccountId = self.account_id
+        self.client.send(pnl_request)
+
+    def _on_trader_response(self, response) -> None:
+        if response.ctidTraderAccountId != self.account_id:
+            return
+
+        self._pending_account_responses.discard("trader")
+        trader = response.trader
+        if not trader.HasField("moneyDigits"):
+            self._report_data_error(
+                "Ignoring cTrader account balance without moneyDigits."
+            )
+            self._try_publish_account_facts()
+            return
+
+        self._account_balance = trader.balance / (10 ** trader.moneyDigits)
+        self._account_balance_received_at = datetime.now(timezone.utc)
+        self._account_deposit_asset_id = trader.depositAssetId
+        if trader.HasField("leverageInCents") and trader.leverageInCents > 0:
+            self._account_leverage = trader.leverageInCents / 100
+        else:
+            self._account_leverage = None
+            self._report_data_error(
+                "cTrader account leverage was not provided; leverage is unavailable."
+            )
+        self._try_publish_account_facts()
+
+    def _on_position_pnl_response(self, response) -> None:
+        if response.ctidTraderAccountId != self.account_id:
+            return
+
+        self._pending_account_responses.discard("position_pnl")
+        if not response.HasField("moneyDigits"):
+            self._report_data_error(
+                "Ignoring cTrader unrealized PnL without moneyDigits."
+            )
+            self._try_publish_account_facts()
+            return
+
+        scale = 10 ** response.moneyDigits
+        self._account_net_unrealized_pnl = sum(
+            position.netUnrealizedPnL for position in response.positionUnrealizedPnL
+        ) / scale
+        self._account_pnl_received_at = datetime.now(timezone.utc)
+        self._try_publish_account_facts()
+
+    def _try_publish_account_facts(self) -> None:
+        if self._pending_account_responses:
+            return
+        required_values = (
+            self._account_balance,
+            self._account_deposit_asset_id,
+            self._account_balance_received_at,
+            self._account_net_unrealized_pnl,
+            self._account_pnl_received_at,
+        )
+        if any(value is None for value in required_values):
+            return
+        if self.on_account_facts is None:
+            return
+
+        balance = self._account_balance
+        net_unrealized_pnl = self._account_net_unrealized_pnl
+        balance_received_at = self._account_balance_received_at
+        pnl_received_at = self._account_pnl_received_at
+        if (
+            balance is None
+            or net_unrealized_pnl is None
+            or balance_received_at is None
+            or pnl_received_at is None
+            or self._account_deposit_asset_id is None
+        ):
+            return
+
+        self.on_account_facts(
+            AccountFacts(
+                account_id=self.account_id,
+                observed_at=max(balance_received_at, pnl_received_at),
+                balance_received_at=balance_received_at,
+                unrealized_pnl_received_at=pnl_received_at,
+                balance=balance,
+                net_unrealized_pnl=net_unrealized_pnl,
+                equity=balance + net_unrealized_pnl,
+                leverage=self._account_leverage,
+                deposit_asset_id=self._account_deposit_asset_id,
+                equity_calculation="balance + net unrealized PnL",
+                equity_note=(
+                    "This calculated equity does not include potential closing "
+                    "commissions."
+                ),
+            )
+        )
+
+    def _on_symbols_list(self, client, response) -> None:
+        symbol = next(
+            (item for item in response.symbol if item.symbolName == self.symbol_name),
+            None,
+        )
+        if symbol is None:
+            self._set_connection_state(
+                "error",
+                f"cTrader did not provide the requested symbol {self.symbol_name}.",
+            )
+            client.stopService()
+            return
+
+        self.symbol_id = symbol.symbolId
+        if (
+            not symbol.HasField("baseAssetId")
+            or not symbol.HasField("quoteAssetId")
+            or symbol.baseAssetId <= 0
+            or symbol.quoteAssetId <= 0
+        ):
+            self._report_data_error(
+                f"Broker asset IDs are unavailable for {self.symbol_name}; "
+                "lot sizing cannot be connected."
+            )
+        else:
+            self._base_asset_id = symbol.baseAssetId
+            self._quote_asset_id = symbol.quoteAssetId
+            self._request_symbol_details(client)
+        self._subscribe(client)
+
+    def _on_symbol_changed(self, client, event) -> None:
+        if (
+            event.ctidTraderAccountId != self.account_id
+            or self.symbol_id is None
+            or self.symbol_id not in event.symbolId
+        ):
+            return
+        if self.on_symbol_info is not None:
+            self.on_symbol_info(None)
+        self._request_symbol_details(client)
+
+    def _request_symbol_details(self, client) -> None:
+        if self.symbol_id is None:
+            return
+        symbol_request = ProtoOASymbolByIdReq()
+        symbol_request.ctidTraderAccountId = self.account_id
+        symbol_request.symbolId.append(self.symbol_id)
+        client.send(symbol_request)
+
+    def _on_symbol_details(self, response) -> None:
+        if (
+            response.ctidTraderAccountId != self.account_id
+            or self.symbol_id is None
+            or self._base_asset_id is None
+            or self._quote_asset_id is None
+        ):
+            return
+
+        symbol = next(
+            (item for item in response.symbol if item.symbolId == self.symbol_id),
+            None,
+        )
+        if symbol is None:
+            self._report_data_error(
+                f"cTrader did not provide full broker specifications for "
+                f"{self.symbol_name}."
+            )
+            return
+
+        required_fields = (
+            "digits",
+            "pipPosition",
+            "lotSize",
+            "minVolume",
+            "stepVolume",
+            "maxVolume",
+        )
+        if any(not symbol.HasField(field) for field in required_fields):
+            self._report_data_error(
+                f"cTrader returned incomplete broker specifications for "
+                f"{self.symbol_name}; lot sizing is unavailable."
+            )
+            return
+
+        if self.on_symbol_info is not None:
+            self.on_symbol_info(
+                BrokerSymbolInfo(
+                    symbol=self.symbol_name,
+                    symbol_id=self.symbol_id,
+                    base_asset_id=self._base_asset_id,
+                    quote_asset_id=self._quote_asset_id,
+                    digits=symbol.digits,
+                    pip_position=symbol.pipPosition,
+                    lot_size_cents=symbol.lotSize,
+                    minimum_volume_cents=symbol.minVolume,
+                    volume_step_cents=symbol.stepVolume,
+                    maximum_volume_cents=symbol.maxVolume,
+                    maximum_exposure_cents=(
+                        symbol.maxExposure if symbol.HasField("maxExposure") else None
+                    ),
+                )
+            )
+
+    def _subscribe(self, client) -> None:
+        if self.symbol_id is None:
+            raise RuntimeError("Cannot subscribe before the symbol ID is known.")
+
+        spot_request = ProtoOASubscribeSpotsReq()
+        spot_request.ctidTraderAccountId = self.account_id
+        spot_request.symbolId.append(self.symbol_id)
+        client.send(spot_request)
+
+        candle_request = ProtoOASubscribeLiveTrendbarReq()
+        candle_request.ctidTraderAccountId = self.account_id
+        candle_request.symbolId = self.symbol_id
+        candle_request.period = ProtoOATrendbarPeriod.M5
+        client.send(candle_request)
+        self._set_connection_state("subscribing", f"Subscribing to {self.symbol_name} data.")
+
+    def _on_subscription_confirmed(self, payload_type: int) -> None:
+        self._confirmed_subscriptions.add(payload_type)
+        expected = {
+            ProtoOASubscribeSpotsRes().payloadType,
+            ProtoOASubscribeLiveTrendbarRes().payloadType,
+        }
+        if expected.issubset(self._confirmed_subscriptions):
+            self._set_connection_state("subscribed", f"Receiving {self.symbol_name} data.")
+
+    def _on_spot_event(self, event) -> None:
+        if (
+            event.ctidTraderAccountId != self.account_id
+            or event.symbolId != self.symbol_id
+        ):
+            return
+
+        has_bid = event.HasField("bid")
+        has_ask = event.HasField("ask")
+        if has_bid or has_ask:
+            if event.timestamp <= 0:
+                self._report_data_error("Ignoring a quote without a valid UTC timestamp.")
+            elif (has_bid and event.bid <= 0) or (has_ask and event.ask <= 0):
+                self._report_data_error("Ignoring a quote with a non-positive price.")
+            else:
+                if has_bid:
+                    self._latest_bid = event.bid / CTRADER_PRICE_SCALE
+                if has_ask:
+                    self._latest_ask = event.ask / CTRADER_PRICE_SCALE
+                if (
+                    self._latest_bid is not None
+                    and self._latest_ask is not None
+                    and self.on_quote is not None
+                ):
+                    quote_time = datetime.fromtimestamp(
+                        event.timestamp / 1000,
+                        tz=timezone.utc,
+                    )
+                    self.on_quote(
+                        LiveQuote(
+                            symbol=self.symbol_name,
+                            time=quote_time,
+                            bid=self._latest_bid,
+                            ask=self._latest_ask,
+                        )
+                    )
+
+        for trendbar in sorted(
+            event.trendbar,
+            key=lambda item: item.utcTimestampInMinutes,
+        ):
+            if trendbar.period == ProtoOATrendbarPeriod.M5:
+                self._update_m5_candle(trendbar)
+
+    def _decode_m5_candle(self, trendbar) -> Optional[Candle]:
+        if trendbar.utcTimestampInMinutes <= 0:
+            self._report_data_error("Ignoring an M5 candle without a valid UTC timestamp.")
+            return None
+
+        low = trendbar.low / CTRADER_PRICE_SCALE
+        open_price = (trendbar.low + trendbar.deltaOpen) / CTRADER_PRICE_SCALE
+        high = (trendbar.low + trendbar.deltaHigh) / CTRADER_PRICE_SCALE
+        close = (trendbar.low + trendbar.deltaClose) / CTRADER_PRICE_SCALE
+        if (
+            low <= 0
+            or open_price <= 0
+            or high <= 0
+            or close <= 0
+            or low > min(open_price, close)
+            or high < max(open_price, close)
+        ):
+            self._report_data_error("Ignoring a malformed M5 candle from cTrader.")
+            return None
+
+        return Candle(
+            symbol=self.symbol_name,
+            timeframe="M5",
+            time=datetime.fromtimestamp(
+                trendbar.utcTimestampInMinutes * 60,
+                tz=timezone.utc,
+            ),
+            open=open_price,
+            high=high,
+            low=low,
+            close=close,
+            volume=trendbar.volume,
+        )
+
+    def _update_m5_candle(self, trendbar) -> None:
+        candle = self._decode_m5_candle(trendbar)
+        if candle is None:
+            return
+
+        active_candle = self._active_m5_candle
+        if active_candle is None:
+            self._active_m5_candle = candle
+            return
+        if candle.time < active_candle.time:
+            self._report_data_error("Ignoring an out-of-order M5 candle from cTrader.")
+            return
+        if candle.time == active_candle.time:
+            self._active_m5_candle = candle
+            return
+
+        if candle.time - active_candle.time > timedelta(minutes=5):
+            self._report_data_error(
+                f"Missing one or more M5 candles before {candle.time.isoformat()}."
+            )
+
+        self._active_m5_candle = candle
+        if self.on_closed_candle is not None:
+            self.on_closed_candle(active_candle)
+
+    def start(self, install_signal_handlers: bool = True) -> None:
+        if reactor.running:
+            raise RuntimeError("The Twisted reactor is already running.")
+        self._set_connection_state("connecting", f"Starting cTrader feed for {self.symbol_name}.")
         self.client.startService()
-        reactor.run() # This blocks and keeps the connection alive
+        reactor.run(installSignalHandlers=install_signal_handlers)

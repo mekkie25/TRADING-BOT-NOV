@@ -1,10 +1,6 @@
-"""
-Module 7: Equilibrium
-Depends on: market_structure.py, common.py.
+"""Report equilibrium and price location within a supplied market range."""
 
-Purpose: Find the midpoint of any range and judge cheap from expensive.
-"""
-
+import math
 import pandas as pd
 from dataclasses import dataclass
 from enum import Enum
@@ -66,6 +62,8 @@ class EquilibriumResult:
 
 def _build_range_info(high: float, low: float, config: EquilibriumConfig) -> RangeInfo:
     """Constructs a RangeInfo object with 50% EQ and optional 25/75 quartiles."""
+    if not math.isfinite(high) or not math.isfinite(low):
+        raise ValueError("Range high and low must be finite prices.")
     if high <= low:
         raise ValueError(f"Invalid range: High ({high}) must be > Low ({low})")
     
@@ -179,15 +177,42 @@ def analyze(df: pd.DataFrame, range_mode: RangeMode = RangeMode.SWING, high: Opt
         }
         
     zone = get_price_zone(current_price, range_info, config)
-    distance_pct = abs(current_price - range_info.equilibrium) / range_info.range_size
+    distance_pct = (
+        abs(current_price - range_info.equilibrium)
+        / range_info.range_size
+        * 100
+    )
+    current_time = df.iloc[-1]["time"]
+    zone_label = zone.value.lower().replace("_", " ")
+    summary = (
+        f"At {current_time}, price is {current_price} in the {zone_label} "
+        f"part of the range from {range_info.low} to {range_info.high}; "
+        f"equilibrium is {range_info.equilibrium}."
+    )
+    if config.enable_quartiles:
+        summary += (
+            f" The lower quartile is {range_info.quartile_low} and the upper "
+            f"quartile is {range_info.quartile_high}; these are range levels, "
+            "not a claim that either is a best trade area."
+        )
     
     return {
+        "summary": summary,
         "current_price": current_price,
+        "current_time": current_time,
         "range_info": range_info,
         "zone": zone,
         "distance_to_eq_pct": distance_pct,
         "is_discount": zone == PriceZone.DISCOUNT,
         "is_premium": zone == PriceZone.PREMIUM,
-        "in_optimal_discount": current_price <= range_info.quartile_low if config.enable_quartiles else False,
-        "in_optimal_premium": current_price >= range_info.quartile_high if config.enable_quartiles else False
+        "at_or_below_lower_quartile": (
+            current_price <= range_info.quartile_low
+            if config.enable_quartiles and range_info.quartile_low is not None
+            else False
+        ),
+        "at_or_above_upper_quartile": (
+            current_price >= range_info.quartile_high
+            if config.enable_quartiles and range_info.quartile_high is not None
+            else False
+        ),
     }

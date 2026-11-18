@@ -26,6 +26,9 @@ Data (price candles, news calendar) feeds steps 2 and 7.
 - The strategies were written by AI from transcripts of mentor videos. They are NOT confirmed proven. The AI may have mis-transcribed or used its own logic.
 - The backtester is NOT verified. Backtest results are NOT trusted. Never present them as facts.
 
+## Backtesting goal
+The offline EURUSD H1 backtest prototype is implemented but not verified; its results are untrusted. It must replay history in time order, use only information available at each moment, and track account balance and equity. The goal and current limits are described in `docs/CONTRACTS.md`.
+
 ## Golden rules
 1. Every part stays in its own lane. A file may use another file, but never copies or tangles its code into it. When something breaks, only that one file should need to change.
 2. Plain trading names that anyone with basic trading knowledge understands: bullish_market, ranging_market, stop_loss, break_even, entry_condition_1. No clever or technical names.
@@ -39,13 +42,14 @@ Data (price candles, news calendar) feeds steps 2 and 7.
 
 ## Where things live today
 (We move toward the cycle layout ONE piece at a time, never all at once.)
-- trading-engine/knowledge/ = the foundation (still called "knowledge" for now)
+- trading-engine/knowledge/ = the foundation (still called "knowledge" for now); `stop_loss.py`, `take_profit.py`, and `break_even.py` report supplied position levels against a quote; `spread.py` reports the bid/ask difference and only converts it when pip or tick size is supplied; `drawdown.py` reports equity decline from a supplied peak; `average_daily_range.py` reports the mean range of completed daily candles; `average_candle_range.py` reports mean range for an explicitly selected supported timeframe; `timeframes.py` describes explicit candle intervals; `multi_timeframe_alignment.py` compares market structure across supplied timeframes; `round_numbers.py` reports configured round-number levels; `break_retest.py` reports a price-level break and later touch without claiming the level held; `previous_day_levels.py` reports the observed prior UTC day's high and low; `economic_calendar.py` reports upcoming events and local snapshot freshness; `time_structure.py` reports exchange-local session and killzone clocks; `support_resistance.py` reports confirmed swing levels as candidates; `fair_value_gap.py` and `inverse_fvg.py` report configured gap formations and status; `liquidity.py` reports equal-swing pools and sweep status; `equilibrium.py` reports range midpoint, quartiles, and price location; `trend_lines.py` reports candidate lines across supplied timeframes; `daily_bias.py` exists but its scoring rules are unverified. Weekly bias is requested but not implemented; keep it as a separate report if built.
 - trading-engine/strategies/ = strategies
 - trading-engine/engine/ = simulator and models (testing)
-- trading-engine/broker/ = costs and fills (execution)
+- trading-engine/risk_management.py = account risk checks using explicitly supplied limits and account state; no orders
+- trading-engine/broker/ = costs and fills; `lot_sizing.py` calculates position size; `ctrader_symbol_specs.py` adapts cTrader Forex contract and volume fields without guessing currency conversion
 - trading-engine/analytics/ = results and metrics (review)
-- trading-engine/data/ = price data. trading-engine/news_feed/ = news calendar
-- trading-bot-control-center/ = the screen (UI)
+- trading-engine/data/ = price data, data-quality reports, and shared timeframe lengths. `knowledge/economic_calendar.py` reports local calendar snapshots; the control center opens the free Forex Factory calendar but does not download its events
+- trading-bot-control-center/ = the screen (UI), including `pages/EconomicCalendarPage.tsx` for the yearly event calendar
 - Old bot, for reference only: github.com/mekkie25/trading-portal
 
 ## The old bot (a source to borrow from)
