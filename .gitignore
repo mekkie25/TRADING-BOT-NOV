@@ -21,3 +21,4 @@ astpack-output.*
 
 # If you don't want the parquet data file in git:
 trading-engine/data/*.parquet
+old-bot/
