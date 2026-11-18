@@ -8,3 +8,16 @@ node_modules/
 .vscode/
 dist/
 repomix-output.xml
+# Repomix / code-packing artifacts
+repomix-output.xml
+repomix-output.*
+astpack-output.md
+astpack-output.*
+
+# Archives (keep source in git, not zips)
+*.zip
+*.tar.gz
+*.7z
+
+# If you don't want the parquet data file in git:
+trading-engine/data/*.parquet
