@@ -12,4 +12,5 @@ TIMEFRAME_LENGTHS = {
     "H2": timedelta(hours=2),
     "H4": timedelta(hours=4),
     "D1": timedelta(days=1),
+    "W1": timedelta(weeks=1),
 }
