@@ -1,5 +1,13 @@
 # Trading Bot - read this first
 
+## Strategy build rules
+1) The spec is docs/MASTER_STRATEGY_FILE_v1_9.md and must be read before building any strategy.
+2) One file per strategy in trading-engine/strategies/, one test file each. Do not create a folder per strategy.
+3) Never rewrite or delete an existing file. Extend it.
+4) Build one strategy at a time, then stop and report.
+5) Keep stops and targets tunable (spec Section 12) and keep every spec variant selectable.
+6) If two things in the spec conflict, tell me. Do not change the spec's meaning.
+
 ## The big idea
 A forex trading bot that behaves like a STUDENT. It first learns the basics of forex, then learns to read the market, then to trade, protect its money, and learn from its own results. Everything is built as separate parts, each in its own lane.
 
