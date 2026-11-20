@@ -8,6 +8,16 @@
 5) Keep stops and targets tunable (spec Section 12) and keep every spec variant selectable.
 6) If two things in the spec conflict, tell me. Do not change the spec's meaning.
 
+-## Token-saving rules (free AI plans have small rate limits, so send as little as possible)
+1) Do NOT read the whole spec file (it is about 82 KB). Read only: the section of the strategy being built, plus Section 0 (lines 7-35), Section 11 (lines 829-900) and Section 12 (line 901 to the end). Use line ranges, not the whole file.
+2) Spec line ranges for v1.9 (if the file changes, find the headings instead): 3.1 Grabber 181-212; 3.2 Asia fade 213-228; 3.3 Asia breakout 229-243; 3.4 ORB 244-268; 3.5 Power Ranger 269-288; 3.6 Cracker 289-316; 3.7 OES A 317-332; 3.8 OES B 333-349; 3.9 ATH 350-362; 3.10 Intra-Range 363-368; 3.11 Reversal 369-376; 3.12 Pivot break-retest 377-389; 3.13 Value area 390-398; 3.14 VWAP 399-406; 3.15 First pullback 407-410; 3.16 513 411-415; 3.17 5M 200 EMA 416-421; 3.18 IFVG 422-425; 3.19 Grids 426-429; 3.20 Fibonacci 430-433; 3.21 Candlestick types 434-441; 3.22 Trend line 442-449.
+3) Read only the files the task names, plus AGENTS.md. Do not scan the whole repository.
+4) Never read these unless I ask: agy_backup/, venv/, node_modules/, repomix-port-context.xml, astpack-output.md, trading-bot-control-center.zip, trading-bot-control-center/.
+5) Run only the tests for the files you changed, not the whole test suite. Do not run tests/news_feed (it has a known unrelated import error).
+6) Keep replies short. Do not paste whole files back in the chat. Report: what changed, the test result, and the list of changed files.
+7) If you get a rate-limit error (429 or "quota"), STOP and tell me. Do not retry in a loop.
+8) Do not do extra work I did not ask for. One strategy per chat, then stop.
+
 ## The big idea
 A forex trading bot that behaves like a STUDENT. It first learns the basics of forex, then learns to read the market, then to trade, protect its money, and learn from its own results. Everything is built as separate parts, each in its own lane.
 
@@ -69,3 +79,4 @@ An earlier version of this bot exists. It has features the new bot lacks. It is 
 - Full list of what is worth borrowing: docs/OLD_BOT.md. Read it before building anything new. The feature you are asked to build may already exist there.
 - Never copy old code blindly. It may have bugs. Read it, rebuild it to follow this project's rules and docs/CONTRACTS.md, and give it plain names.
 - After borrowing something, mark it DONE in docs/OLD_BOT.md and add a line to docs/DECISIONS.md.
+-
