@@ -188,6 +188,80 @@ class GrabberStrategyTests(unittest.TestCase):
         self.assertEqual(signal.direction, Direction.BUY)
         self.assertEqual(signal.variant, "eq_confirmation")
 
+    def test_asia_range_eq_option(self):
+        # When eq_source='asia', EQ is (asia_high + asia_low) / 2 = (110 + 90) / 2 = 100.0
+        # facts.previous_day.equilibrium is set to a different value (80.0)
+        rows = [
+            (91.0, 92.0, 89.0, 91.0),   # sweep Asia low
+            (91.0, 100.5, 91.0, 100.2), # reach Asia EQ (100.0)
+            (100.2, 101.5, 99.8, 101.0),# hold Asia EQ as support
+        ]
+        candles = make_test_candles(rows)
+        facts = make_test_facts(asia_high=110.0, asia_low=90.0, equilibrium=80.0)
+
+        signal = evaluate(candles, facts, self.spec, parameters={"eq_source": "asia"})
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.BUY)
+
+    def test_fixed_stops_use_instrument_specs_xauusd(self):
+        # (1) Test that fixed 30/60 stops go through instrument specs for XAUUSD (30 pips = 3.00 in price)
+        spec_gold = get_instrument_spec("XAUUSD")
+        self.assertEqual(spec_gold.pip_size, 0.10)
+        rows = [
+            (2650.0, 2652.0, 2640.0, 2645.0), # sweep low 2640.0 & reclaim
+            (2645.0, 2662.0, 2645.0, 2661.0), # rise to EQ
+            (2661.0, 2665.0, 2659.0, 2662.0), # hold EQ as support
+        ]
+        candles = make_test_candles(rows)
+        facts = make_test_facts(
+            asia_high=2670.0,
+            asia_low=2642.0,
+            equilibrium=2660.0,
+            acs=5.0,
+        )
+        signal = evaluate(
+            candles,
+            facts,
+            spec_gold,
+            parameters={
+                "sl_mode": "fixed",
+                "tp_mode": "fixed",
+                "fixed_stop": 30.0,
+                "fixed_target": 60.0,
+            },
+        )
+        self.assertIsNotNone(signal)
+        # 30 pips * 0.10 = 3.00 price distance
+        self.assertAlmostEqual(signal.stop_distance, 3.00)
+        # 60 pips * 0.10 = 6.00 price distance
+        self.assertAlmostEqual(signal.target_distance, 6.00)
+
+    def test_previous_day_high_low_selectable_as_targets(self):
+        # (2) Test that previous daily high/low is selectable as targets
+        rows = [
+            (91.0, 92.0, 89.0, 91.0),
+            (91.0, 95.8, 91.0, 95.5),
+            (95.5, 96.5, 94.8, 96.0),
+        ]
+        candles = make_test_candles(rows)
+        # In make_test_facts: previous_day.high = 105.0, low = 85.0
+        facts = make_test_facts(asia_high=100.0, asia_low=90.0, equilibrium=95.0)
+
+        # Bullish signal with target_choice="previous_day" should target facts.previous_day.high (105.0)
+        sig_buy = evaluate(candles, facts, self.spec, parameters={"target_choice": "previous_day"})
+        self.assertIsNotNone(sig_buy)
+        self.assertEqual(sig_buy.structural_target_price, 105.0)
+
+        # Bearish signal with target_choice="previous_day" should target facts.previous_day.low (85.0)
+        rows_sell = [
+            (99.0, 101.5, 98.5, 99.0),
+            (99.0, 99.0, 94.0, 94.5),
+            (94.5, 95.2, 93.8, 94.0),
+        ]
+        sig_sell = evaluate(make_test_candles(rows_sell), facts, self.spec, parameters={"target_choice": "previous_day"})
+        self.assertIsNotNone(sig_sell)
+        self.assertEqual(sig_sell.structural_target_price, 85.0)
+
     def test_tunable_stop_and_target_parameters(self):
         rows = [
             (91.0, 92.0, 89.0, 91.0),
