@@ -1,6 +1,6 @@
 import unittest
 
-from knowledge.fibonacci_retracement import (
+from indicators.fibonacci_retracement import (
     DEFAULT_FIBONACCI_RATIOS,
     calculate_fibonacci_levels,
 )

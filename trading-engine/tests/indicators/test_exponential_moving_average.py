@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from knowledge.exponential_moving_average import (
+from indicators.exponential_moving_average import (
     EMA_PERIODS,
     analyze_exponential_moving_averages,
 )

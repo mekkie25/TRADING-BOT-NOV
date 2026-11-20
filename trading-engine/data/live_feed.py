@@ -129,7 +129,7 @@ class LiveCTraderFeed:
         self.on_status = on_status
         self._latest_bid: Optional[float] = None
         self._latest_ask: Optional[float] = None
-        self._active_m5_candle: Optional[Candle] = None
+        self._active_candles: dict[str, Candle] = {}
         self._confirmed_subscriptions: Set[int] = set()
         self._base_asset_id: Optional[int] = None
         self._quote_asset_id: Optional[int] = None
@@ -194,7 +194,7 @@ class LiveCTraderFeed:
             self._account_refresh.stop()
         self._latest_bid = None
         self._latest_ask = None
-        self._active_m5_candle = None
+        self._active_candles.clear()
         self._confirmed_subscriptions.clear()
         self._pending_account_responses.clear()
         self._set_connection_state("disconnected", f"Disconnected from cTrader: {reason}")
@@ -462,12 +462,16 @@ class LiveCTraderFeed:
         spot_request.symbolId.append(self.symbol_id)
         client.send(spot_request)
 
-        candle_request = ProtoOASubscribeLiveTrendbarReq()
-        candle_request.ctidTraderAccountId = self.account_id
-        candle_request.symbolId = self.symbol_id
-        candle_request.period = ProtoOATrendbarPeriod.M5
-        client.send(candle_request)
-        self._set_connection_state("subscribing", f"Subscribing to {self.symbol_name} data.")
+        for period in (ProtoOATrendbarPeriod.M1, ProtoOATrendbarPeriod.M5):
+            candle_request = ProtoOASubscribeLiveTrendbarReq()
+            candle_request.ctidTraderAccountId = self.account_id
+            candle_request.symbolId = self.symbol_id
+            candle_request.period = period
+            client.send(candle_request)
+        self._set_connection_state(
+            "subscribing",
+            f"Subscribing to {self.symbol_name} quotes and M1/M5 candles.",
+        )
 
     def _on_subscription_confirmed(self, payload_type: int) -> None:
         self._confirmed_subscriptions.add(payload_type)
@@ -515,16 +519,36 @@ class LiveCTraderFeed:
                         )
                     )
 
+        closed_candles = []
+        periods = {
+            ProtoOATrendbarPeriod.M1: "M1",
+            ProtoOATrendbarPeriod.M5: "M5",
+        }
         for trendbar in sorted(
             event.trendbar,
             key=lambda item: item.utcTimestampInMinutes,
         ):
-            if trendbar.period == ProtoOATrendbarPeriod.M5:
-                self._update_m5_candle(trendbar)
+            timeframe = periods.get(trendbar.period)
+            if timeframe is not None:
+                closed_candle = self._update_candle(trendbar, timeframe)
+                if closed_candle is not None:
+                    closed_candles.append(closed_candle)
 
-    def _decode_m5_candle(self, trendbar) -> Optional[Candle]:
+        closed_candles.sort(
+            key=lambda candle: (
+                candle.time,
+                -timedelta(minutes=int(candle.timeframe[1:])).total_seconds(),
+            )
+        )
+        if self.on_closed_candle is not None:
+            for candle in closed_candles:
+                self.on_closed_candle(candle)
+
+    def _decode_candle(self, trendbar, timeframe: str) -> Optional[Candle]:
         if trendbar.utcTimestampInMinutes <= 0:
-            self._report_data_error("Ignoring an M5 candle without a valid UTC timestamp.")
+            self._report_data_error(
+                f"Ignoring a {timeframe} candle without a valid UTC timestamp."
+            )
             return None
 
         low = trendbar.low / CTRADER_PRICE_SCALE
@@ -539,12 +563,14 @@ class LiveCTraderFeed:
             or low > min(open_price, close)
             or high < max(open_price, close)
         ):
-            self._report_data_error("Ignoring a malformed M5 candle from cTrader.")
+            self._report_data_error(
+                f"Ignoring a malformed {timeframe} candle from cTrader."
+            )
             return None
 
         return Candle(
             symbol=self.symbol_name,
-            timeframe="M5",
+            timeframe=timeframe,
             time=datetime.fromtimestamp(
                 trendbar.utcTimestampInMinutes * 60,
                 tz=timezone.utc,
@@ -556,30 +582,33 @@ class LiveCTraderFeed:
             volume=trendbar.volume,
         )
 
-    def _update_m5_candle(self, trendbar) -> None:
-        candle = self._decode_m5_candle(trendbar)
+    def _update_candle(self, trendbar, timeframe: str) -> Optional[Candle]:
+        candle = self._decode_candle(trendbar, timeframe)
         if candle is None:
-            return
+            return None
 
-        active_candle = self._active_m5_candle
+        active_candle = self._active_candles.get(timeframe)
         if active_candle is None:
-            self._active_m5_candle = candle
-            return
+            self._active_candles[timeframe] = candle
+            return None
         if candle.time < active_candle.time:
-            self._report_data_error("Ignoring an out-of-order M5 candle from cTrader.")
-            return
-        if candle.time == active_candle.time:
-            self._active_m5_candle = candle
-            return
-
-        if candle.time - active_candle.time > timedelta(minutes=5):
             self._report_data_error(
-                f"Missing one or more M5 candles before {candle.time.isoformat()}."
+                f"Ignoring an out-of-order {timeframe} candle from cTrader."
+            )
+            return None
+        if candle.time == active_candle.time:
+            self._active_candles[timeframe] = candle
+            return None
+
+        candle_duration = timedelta(minutes=int(timeframe[1:]))
+        if candle.time - active_candle.time > candle_duration:
+            self._report_data_error(
+                f"Missing one or more {timeframe} candles before "
+                f"{candle.time.isoformat()}."
             )
 
-        self._active_m5_candle = candle
-        if self.on_closed_candle is not None:
-            self.on_closed_candle(active_candle)
+        self._active_candles[timeframe] = candle
+        return active_candle
 
     def start(self, install_signal_handlers: bool = True) -> None:
         if reactor.running:

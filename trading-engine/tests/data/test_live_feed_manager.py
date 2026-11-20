@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from threading import Event
 from unittest.mock import patch
 
 from ctrader_open_api import EndPoints
@@ -113,6 +114,107 @@ class LiveFeedManagerTests(unittest.TestCase):
         self.assertEqual(snapshot["quote"]["time"], quote_time.isoformat())
         self.assertEqual(snapshot["lastClosedCandle"]["time"], candle_time.isoformat())
         self.assertEqual(snapshot["lastClosedCandle"]["timeframe"], "M5")
+
+    def test_completed_m1_candle_builds_and_stores_a_market_snapshot(self):
+        manager = LiveFeedManager()
+        self.addCleanup(manager.stop)
+        observed_at = datetime(2026, 1, 5, 12, 1, tzinfo=timezone.utc)
+        m1_candle = Candle(
+            symbol="EURUSD",
+            timeframe="M1",
+            time=observed_at - timedelta(minutes=1),
+            open=1.1,
+            high=1.101,
+            low=1.099,
+            close=1.1005,
+            volume=10,
+        )
+        quote = LiveQuote(
+            symbol="EURUSD",
+            time=observed_at,
+            bid=1.1,
+            ask=1.1001,
+        )
+        manager._record_quote(quote)
+
+        with patch(
+            "data.live_feed_manager.build_market_snapshot",
+            return_value={"as_of": observed_at, "entry_criteria_evaluated": False},
+        ) as build_snapshot:
+            manager._record_closed_candle(m1_candle)
+            self.assertTrue(manager._market_snapshot_update_complete.wait(timeout=2))
+
+        snapshot = manager.get_snapshot()
+        self.assertEqual(snapshot["candleHistoryCounts"]["M1"], 1)
+        self.assertEqual(snapshot["lastClosedCandles"]["M1"]["timeframe"], "M1")
+        self.assertEqual(manager.get_market_snapshot()["as_of"], observed_at)
+        self.assertEqual(build_snapshot.call_count, 1)
+        self.assertEqual(build_snapshot.call_args.args[1], observed_at)
+
+    def test_completed_m1_candle_does_not_wait_for_snapshot_calculation(self):
+        manager = LiveFeedManager()
+        self.addCleanup(manager.stop)
+        observed_at = datetime(2026, 1, 5, 12, 1, tzinfo=timezone.utc)
+        snapshot_started = Event()
+        allow_snapshot_to_finish = Event()
+        m1_candle = Candle(
+            symbol="EURUSD",
+            timeframe="M1",
+            time=observed_at - timedelta(minutes=1),
+            open=1.1,
+            high=1.101,
+            low=1.099,
+            close=1.1005,
+            volume=10,
+        )
+
+        def wait_for_snapshot_release(*_args):
+            snapshot_started.set()
+            allow_snapshot_to_finish.wait(timeout=2)
+            return {"as_of": observed_at, "entry_criteria_evaluated": False}
+
+        with patch(
+            "data.live_feed_manager.build_market_snapshot",
+            side_effect=wait_for_snapshot_release,
+        ):
+            manager._record_closed_candle(m1_candle)
+            self.assertTrue(snapshot_started.wait(timeout=1))
+            self.assertFalse(manager._market_snapshot_update_complete.is_set())
+            allow_snapshot_to_finish.set()
+            self.assertTrue(manager._market_snapshot_update_complete.wait(timeout=2))
+
+        self.assertEqual(manager.get_market_snapshot()["as_of"], observed_at)
+
+    def test_snapshot_calculation_error_is_reported_in_live_status(self):
+        manager = LiveFeedManager()
+        self.addCleanup(manager.stop)
+        observed_at = datetime(2026, 1, 5, 12, 1, tzinfo=timezone.utc)
+        m1_candle = Candle(
+            symbol="EURUSD",
+            timeframe="M1",
+            time=observed_at - timedelta(minutes=1),
+            open=1.1,
+            high=1.101,
+            low=1.099,
+            close=1.1005,
+            volume=10,
+        )
+
+        with (
+            patch(
+                "data.live_feed_manager.build_market_snapshot",
+                side_effect=ValueError("Invalid snapshot input."),
+            ),
+            patch("data.live_feed_manager.logger.exception") as log_exception,
+        ):
+            manager._record_closed_candle(m1_candle)
+            self.assertTrue(manager._market_snapshot_update_complete.wait(timeout=2))
+
+        self.assertEqual(
+            manager.get_snapshot()["marketSnapshotError"],
+            "Invalid snapshot input.",
+        )
+        log_exception.assert_called_once()
 
     def test_account_facts_snapshot_contains_broker_values_and_calculation_note(self):
         manager = LiveFeedManager()

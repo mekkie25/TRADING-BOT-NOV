@@ -1,6 +1,6 @@
 import unittest
 
-from knowledge.pivot_points import (
+from indicators.pivot_points import (
     calculate_pivot_points,
     get_pivot_period,
 )

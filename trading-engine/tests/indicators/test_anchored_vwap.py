@@ -1,6 +1,6 @@
 import unittest
 
-from knowledge.anchored_vwap import calculate_anchored_vwap
+from indicators.anchored_vwap import calculate_anchored_vwap
 
 
 class AnchoredVwapTests(unittest.TestCase):

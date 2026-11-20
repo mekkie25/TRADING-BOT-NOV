@@ -25,6 +25,7 @@ import type {
   JournalTrade,
   KillSwitchResult,
   LiveMarketDataInfo,
+  MarketSnapshotInfo,
   LiveVsBacktestComparison,
   ManualOrderPayload,
   ModifyPositionSlTpPayload,
@@ -257,6 +258,13 @@ export const api = {
       };
     }
     return requestJson<LiveMarketDataInfo>('/api/market/live');
+  },
+
+  async getMarketSnapshot(): Promise<MarketSnapshotInfo | null> {
+    if (USE_MOCK) {
+      return null;
+    }
+    return requestJson<MarketSnapshotInfo>('/api/market/snapshot');
   },
 
   // --- Dashboard & Bot Control ---

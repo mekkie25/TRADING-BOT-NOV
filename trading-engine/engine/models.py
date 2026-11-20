@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 class Direction(Enum):
     BUY = "BUY"
@@ -14,9 +14,26 @@ class PositionSide(Enum):
 @dataclass
 class Signal:
     direction: Direction
-    sl_atr_multiple: float
-    tp_atr_multiple: float
+    sl_atr_multiple: float = 1.5
+    tp_atr_multiple: float = 3.0
     max_spread_pips: float = 2.0
+    strategy_name: str = ""
+    variant: str = "default"
+    session: str = "unknown"
+    sl_mode: str = "volatility_scaled"
+    tp_mode: str = "volatility_scaled"
+    time_limit_seconds: Optional[int] = None
+    stop_distance: Optional[float] = None
+    target_distance: Optional[float] = None
+    stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
+    structural_stop_price: Optional[float] = None
+    structural_target_price: Optional[float] = None
+    average_candle_size: Optional[float] = None
+    confluence_reasons: List[str] = field(default_factory=list)
+    confluence_count: int = 0
+    definition_parameters: Dict[str, object] = field(default_factory=dict)
+    poc_source: Optional[str] = None
 
 @dataclass
 class Trade:
@@ -42,6 +59,19 @@ class Trade:
     slippage_cost: float = 0.0
     commission: float = 0.0
     risk_cash: float = 0.0
+    strategy_name: str = ""
+    strategy_variant: str = "default"
+    session: str = "unknown"
+    sl_mode: str = "volatility_scaled"
+    tp_mode: str = "volatility_scaled"
+    time_limit_seconds: Optional[int] = None
+    average_candle_size: Optional[float] = None
+    confluence_reasons: List[str] = field(default_factory=list)
+    confluence_count: int = 0
+    definition_parameters: Dict[str, object] = field(default_factory=dict)
+    poc_source: Optional[str] = None
+    stop_distance: float = 0.0
+    target_distance: float = 0.0
     
     max_adverse_excursion: float = 0.0
     max_favorable_excursion: float = 0.0

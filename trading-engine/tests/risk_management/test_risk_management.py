@@ -13,7 +13,7 @@ class RiskManagementTests(unittest.TestCase):
         self.limits = RiskLimits(
             max_risk_per_trade_percent=2.0,
             max_daily_loss_percent=5.0,
-            max_daily_trades=3,
+            max_daily_trades=2,
             max_open_positions=2,
         )
         self.account = AccountRiskState(
@@ -66,7 +66,7 @@ class RiskManagementTests(unittest.TestCase):
         account = AccountRiskState(
             equity=10000.0,
             daily_start_equity=10000.0,
-            trades_today=3,
+            trades_today=2,
             open_positions=2,
         )
 
@@ -79,6 +79,31 @@ class RiskManagementTests(unittest.TestCase):
         self.assertEqual(result.status, "FAIL")
         failed_checks = [check.name for check in result.checks if check.status == "FAIL"]
         self.assertEqual(failed_checks, ["Daily trade count", "Open positions"])
+
+    def test_rejects_risk_limits_above_master_strategy_maxima(self):
+        with self.assertRaisesRegex(ValueError, "must not exceed.*maximum of 2"):
+            assess_trade_risk(
+                RiskLimits(
+                    max_risk_per_trade_percent=2.01,
+                    max_daily_loss_percent=5.0,
+                    max_daily_trades=2,
+                    max_open_positions=2,
+                ),
+                self.account,
+                ProposedTradeRisk(planned_loss_cash=100.0),
+            )
+
+        with self.assertRaisesRegex(ValueError, "max_daily_trades.*maximum of 2"):
+            assess_trade_risk(
+                RiskLimits(
+                    max_risk_per_trade_percent=2.0,
+                    max_daily_loss_percent=5.0,
+                    max_daily_trades=3,
+                    max_open_positions=2,
+                ),
+                self.account,
+                ProposedTradeRisk(planned_loss_cash=100.0),
+            )
 
 
 if __name__ == "__main__":

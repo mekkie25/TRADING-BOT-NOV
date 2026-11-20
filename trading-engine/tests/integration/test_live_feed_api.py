@@ -11,6 +11,7 @@ from api import (
     get_equity_curve,
     get_live_lot_size,
     get_live_market_data,
+    get_market_snapshot,
     get_open_positions,
     get_settings,
 )
@@ -28,6 +29,42 @@ class LiveFeedApiTests(unittest.TestCase):
         }
         with patch("api.live_feed_manager.get_snapshot", return_value=snapshot):
             self.assertEqual(get_live_market_data(), snapshot)
+
+    def test_market_snapshot_endpoint_returns_the_latest_report(self):
+        snapshot = {
+            "symbol": "EURUSD",
+            "entry_criteria_evaluated": False,
+        }
+        with patch(
+            "api.live_feed_manager.get_market_snapshot",
+            return_value=snapshot,
+        ):
+            self.assertEqual(get_market_snapshot(), snapshot)
+
+    def test_market_snapshot_endpoint_is_unavailable_before_first_m1_close(self):
+        with patch(
+            "api.live_feed_manager.get_market_snapshot",
+            return_value=None,
+        ), patch("api.live_feed_manager.get_market_snapshot_error", return_value=None):
+            with self.assertRaises(HTTPException) as error:
+                get_market_snapshot()
+
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertIn("first completed report", error.exception.detail)
+
+    def test_market_snapshot_endpoint_reports_a_generation_error(self):
+        with (
+            patch("api.live_feed_manager.get_market_snapshot", return_value=None),
+            patch(
+                "api.live_feed_manager.get_market_snapshot_error",
+                return_value="Invalid snapshot input.",
+            ),
+        ):
+            with self.assertRaises(HTTPException) as error:
+                get_market_snapshot()
+
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertIn("Invalid snapshot input.", error.exception.detail)
 
     def test_settings_uses_the_feed_connection_state(self):
         snapshot = {"connectionState": "Connected"}

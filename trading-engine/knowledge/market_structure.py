@@ -64,42 +64,46 @@ def _find_swings(df: pd.DataFrame, config: MarketStructureConfig) -> List[SwingP
     swings = []
     left = config.swing_lookback_left
     right = config.swing_lookback_right
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+    times = df["time"].array
     
     # We iterate through the dataframe, leaving enough room on both sides
     for i in range(left, len(df) - right):
-        current_candle = df.iloc[i]
+        current_high = highs[i]
+        current_low = lows[i]
         
         # Check for Swing High
         is_high = True
         for j in range(1, left + 1):
-            if df.iloc[i - j]['high'] >= current_candle['high']: is_high = False; break
+            if highs[i - j] >= current_high: is_high = False; break
         if is_high:
             for j in range(1, right + 1):
-                if df.iloc[i + j]['high'] >= current_candle['high']: is_high = False; break
+                if highs[i + j] >= current_high: is_high = False; break
                 
         if is_high:
             swings.append(SwingPoint(
                 type=SwingType.HIGH,
-                price=float(current_candle['high']),
-                occurred_at=current_candle['time'],
-                confirmed_at=df.iloc[i + right]['time']
+                price=float(current_high),
+                occurred_at=times[i],
+                confirmed_at=times[i + right]
             ))
             continue # Move to next candle
 
         # Check for Swing Low
         is_low = True
         for j in range(1, left + 1):
-            if df.iloc[i - j]['low'] <= current_candle['low']: is_low = False; break
+            if lows[i - j] <= current_low: is_low = False; break
         if is_low:
             for j in range(1, right + 1):
-                if df.iloc[i + j]['low'] <= current_candle['low']: is_low = False; break
+                if lows[i + j] <= current_low: is_low = False; break
                 
         if is_low:
             swings.append(SwingPoint(
                 type=SwingType.LOW,
-                price=float(current_candle['low']),
-                occurred_at=current_candle['time'],
-                confirmed_at=df.iloc[i + right]['time']
+                price=float(current_low),
+                occurred_at=times[i],
+                confirmed_at=times[i + right]
             ))
 
     # Sort chronologically by occurrence
@@ -133,10 +137,14 @@ def _find_last_break(df: pd.DataFrame, swings: List[SwingPoint], config: MarketS
     if not swings:
         return BreakEvent(BreakType.NONE, BreakDirection.BULLISH, None, None, None)
 
+    times = df["time"].array
+    closes = df["close"].to_numpy()
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+
     # Iterate from the end of the dataframe backwards to find the most recent break
     for i in range(len(df) - 1, -1, -1):
-        candle = df.iloc[i]
-        candle_time = candle['time']
+        candle_time = times[i]
         
         # We only care about candles that happened AFTER the swing was confirmed
         # (To prevent look-ahead bias)
@@ -151,9 +159,9 @@ def _find_last_break(df: pd.DataFrame, swings: List[SwingPoint], config: MarketS
         # Check Bullish Break (Breaking a High)
         if last_high:
             if config.require_close_for_break:
-                broke = candle['close'] > last_high.price
+                broke = closes[i] > last_high.price
             else:
-                broke = candle['high'] > last_high.price
+                broke = highs[i] > last_high.price
                 
             if broke:
                 # Determine if it's a BOS (continuation) or CHoCH (reversal)
@@ -162,7 +170,7 @@ def _find_last_break(df: pd.DataFrame, swings: List[SwingPoint], config: MarketS
                 # For simplicity, if we are currently BEARISH and break a high, it's a CHoCH.
                 current_trend = _determine_trend_state(valid_swings)
                 break_type = BreakType.BOS if current_trend == TrendState.BULLISH else BreakType.CHOCH
-                break_price = candle["close"] if config.require_close_for_break else candle["high"]
+                break_price = closes[i] if config.require_close_for_break else highs[i]
                 return BreakEvent(
                     break_type,
                     BreakDirection.BULLISH,
@@ -174,14 +182,14 @@ def _find_last_break(df: pd.DataFrame, swings: List[SwingPoint], config: MarketS
         # Check Bearish Break (Breaking a Low)
         if last_low:
             if config.require_close_for_break:
-                broke = candle['close'] < last_low.price
+                broke = closes[i] < last_low.price
             else:
-                broke = candle['low'] < last_low.price
+                broke = lows[i] < last_low.price
                 
             if broke:
                 current_trend = _determine_trend_state(valid_swings)
                 break_type = BreakType.BOS if current_trend == TrendState.BEARISH else BreakType.CHOCH
-                break_price = candle["close"] if config.require_close_for_break else candle["low"]
+                break_price = closes[i] if config.require_close_for_break else lows[i]
                 return BreakEvent(
                     break_type,
                     BreakDirection.BEARISH,

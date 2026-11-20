@@ -51,12 +51,21 @@ def _validate_limits(limits: RiskLimits) -> None:
     for name, value in percent_limits.items():
         if not math.isfinite(value) or not 0 < value <= 100:
             raise ValueError(f"{name} must be greater than 0 and no more than 100.")
+    if limits.max_risk_per_trade_percent > 2.0:
+        raise ValueError(
+            "max_risk_per_trade_percent must not exceed the master-strategy "
+            "maximum of 2."
+        )
     if (
         not isinstance(limits.max_daily_trades, int)
         or isinstance(limits.max_daily_trades, bool)
         or limits.max_daily_trades < 1
     ):
         raise ValueError("max_daily_trades must be a positive integer.")
+    if limits.max_daily_trades > 2:
+        raise ValueError(
+            "max_daily_trades must not exceed the master-strategy maximum of 2."
+        )
     if (
         not isinstance(limits.max_open_positions, int)
         or isinstance(limits.max_open_positions, bool)

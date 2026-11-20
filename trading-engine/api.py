@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from broker.ctrader_symbol_specs import build_ctrader_forex_spec
@@ -170,6 +171,25 @@ def get_pairs():
 @app.get("/api/market/live")
 def get_live_market_data():
     return live_feed_manager.get_snapshot()
+
+@app.get("/api/market/snapshot")
+def get_market_snapshot():
+    snapshot = live_feed_manager.get_market_snapshot()
+    if snapshot is None:
+        snapshot_error = live_feed_manager.get_market_snapshot_error()
+        if snapshot_error is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"The one-minute market snapshot could not be generated: {snapshot_error}",
+            )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The one-minute market snapshot is unavailable until the "
+                "first completed report is generated from an M1 candle."
+            ),
+        )
+    return jsonable_encoder(snapshot)
 
 @app.get("/api/strategies")
 def get_strategies():

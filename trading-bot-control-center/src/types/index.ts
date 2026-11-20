@@ -206,6 +206,24 @@ export interface LiveMarketDataInfo {
   lastClosedCandle: LiveMarketCandleInfo | null;
 }
 
+export interface MarketSnapshotInfo {
+  symbol: ForexPair;
+  as_of: string;
+  updated_by: string;
+  entry_criteria_evaluated: false;
+  market_time: unknown;
+  session: unknown;
+  spread: unknown;
+  reports: Record<'M1' | 'M5', Record<string, unknown>>;
+  multi_timeframe_alignment: unknown;
+  trend_lines: unknown;
+  previous_day_levels: unknown;
+  previous_week_levels: unknown;
+  daily_profiles: unknown;
+  unavailable_reports: Record<string, string>;
+  latest_snapshot_error?: string;
+}
+
 export interface MarketConditionTags {
   volatilityRegime: VolatilityRegime;
   marketStructure: MarketStructure;

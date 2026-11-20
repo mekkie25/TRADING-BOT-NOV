@@ -47,11 +47,11 @@ class LiveCTraderFeedTests(unittest.TestCase):
                 feed = LiveCTraderFeed(**callbacks)
         return feed, client_class.return_value
 
-    def make_bar_event(self, candle_time):
+    def make_bar_event(self, candle_time, timeframe="M5"):
         event = ProtoOASpotEvent()
         event.symbolId = 7
         trendbar = event.trendbar.add()
-        trendbar.period = ProtoOATrendbarPeriod.M5
+        trendbar.period = getattr(ProtoOATrendbarPeriod, timeframe)
         trendbar.utcTimestampInMinutes = int(candle_time.timestamp() // 60)
         trendbar.low = 110000
         trendbar.deltaOpen = 100
@@ -131,6 +131,48 @@ class LiveCTraderFeedTests(unittest.TestCase):
         self.assertEqual(closed_candles[0].high, 1.103)
         self.assertEqual(closed_candles[0].low, 1.1)
         self.assertEqual(closed_candles[0].close, 1.102)
+
+    def test_emits_only_the_previous_m1_candle_after_a_new_one_starts(self):
+        closed_candles = []
+        feed, _ = self.create_feed(on_closed_candle=closed_candles.append)
+        feed.symbol_id = 7
+        first_candle_time = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
+
+        feed._on_message(
+            None,
+            make_message(self.make_bar_event(first_candle_time, "M1")),
+        )
+        self.assertEqual(closed_candles, [])
+
+        feed._on_message(
+            None,
+            make_message(
+                self.make_bar_event(
+                    first_candle_time + timedelta(minutes=1),
+                    "M1",
+                )
+            ),
+        )
+
+        self.assertEqual(len(closed_candles), 1)
+        self.assertEqual(closed_candles[0].timeframe, "M1")
+        self.assertEqual(closed_candles[0].time, first_candle_time)
+
+    def test_subscribes_to_m1_and_m5_candles(self):
+        feed, client = self.create_feed()
+        feed.symbol_id = 7
+        feed._subscribe(client)
+
+        trendbar_requests = [
+            call.args[0]
+            for call in client.send.call_args_list
+            if call.args[0].DESCRIPTOR.name == "ProtoOASubscribeLiveTrendbarReq"
+        ]
+
+        self.assertEqual(
+            {request.period for request in trendbar_requests},
+            {ProtoOATrendbarPeriod.M1, ProtoOATrendbarPeriod.M5},
+        )
 
     def test_disconnect_discards_unfinished_candle(self):
         closed_candles = []
