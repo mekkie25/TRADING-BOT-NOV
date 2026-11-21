@@ -59,6 +59,14 @@ def evaluate(
         bearish = previous["close"] >= facts.asia.low and current["close"] < facts.asia.low
     if bullish == bearish:
         return None
+
+    # Check close-back-inside rejection
+    if bool((parameters or {}).get("close_back_rejection", True)):
+        if bullish and current["close"] < facts.asia.high:
+            return None
+        if bearish and current["close"] > facts.asia.low:
+            return None
+
     direction = Direction.BUY if bullish else Direction.SELL
     if not volume_present(
         current,

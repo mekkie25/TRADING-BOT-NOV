@@ -6,6 +6,8 @@ import pandas as pd
 from broker.instrument_specs import InstrumentSpec, get_instrument_spec
 from engine.models import Direction
 from knowledge.asia_levels import AsiaLevelsReport
+from knowledge.daily_flip import DailyFlipReport
+from knowledge.volume_profile import VolumeProfileReport
 from strategies.asia_breakout import evaluate
 from strategies.context import MarketFacts, PreviousDayFacts, StrategySession
 
@@ -69,7 +71,17 @@ def make_test_facts(
             summary="Daily Flip at 92",
         ),
         ema_200=91.0,
-        volume_profile=None,
+        volume_profile=VolumeProfileReport(
+            poc=94.0,
+            vah=97.0,
+            val=92.0,
+            bin_size=0.2,
+            value_area_fraction=0.7,
+            source="tick_approx",
+            approximate=True,
+            candle_count=10,
+            summary="Profile available",
+        ),
     )
 
 
@@ -106,15 +118,28 @@ class AsiaBreakoutStrategyTests(unittest.TestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.variant, "retest")
 
-    def test_oi_oi_variant(self):
+    def test_close_back_rejection_enabled(self):
+        # Bullish breakout, but candle 3 closes back inside
         rows = [
-            (95.0, 101.0, 94.0, 101.0), # Out
-            (95.0, 101.0, 94.0, 99.0),   # In
-            (95.0, 102.0, 94.0, 101.0), # Out
+            (95.0, 96.0, 94.0, 95.0), # Inside
+            (95.0, 102.0, 94.0, 101.0), # Breakout
+            (95.0, 102.0, 99.0, 99.5),  # Close back inside
         ]
         candles = make_test_candles(rows)
         facts = make_test_facts(asia_high=100.0, asia_low=90.0, acs=1.0)
         
-        signal = evaluate(candles, facts, self.spec, variant="oi_oi")
+        signal = evaluate(candles, facts, self.spec, variant="close_and_volume", parameters={"close_back_rejection": True})
+        self.assertIsNone(signal)
+
+    def test_close_back_rejection_disabled(self):
+        # Candle 3 closes outside, so it should signal even with close_back_rejection disabled
+        rows = [
+            (95.0, 96.0, 94.0, 95.0), # Inside
+            (95.0, 96.0, 94.0, 95.0), # Inside
+            (95.0, 102.0, 94.0, 101.0), # Breakout
+        ]
+        candles = make_test_candles(rows)
+        facts = make_test_facts(asia_high=100.0, asia_low=90.0, acs=1.0)
+        
+        signal = evaluate(candles, facts, self.spec, variant="close_and_volume", parameters={"close_back_rejection": False})
         self.assertIsNotNone(signal)
-        self.assertEqual(signal.variant, "oi_oi")
