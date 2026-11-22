@@ -26,19 +26,27 @@ def evaluate(
     if len(candles) < 2:
         return None
     settings = parameters or {}
-    high_value = settings.get("all_time_high")
+    high_value = settings.get("ath_price")
     if high_value is None:
-        prior = candles.iloc[:-1]
-        if prior.empty:
-            return None
-        high_value = float(prior["high"].max())
+        high_value = settings.get("all_time_high")
+    if high_value is None:
+        return None
     level = float(high_value)
     if not pd.notna(level) or level <= 0:
-        raise ValueError("all_time_high must be a positive finite price.")
+        raise ValueError("ath_price must be a positive finite price.")
     current = candles.iloc[-1]
     previous = candles.iloc[-2]
     if variant == "breakout":
-        if previous["close"] > level or current["close"] <= level or current["close"] <= current["open"]:
+        daily_r3 = settings.get("daily_r3")
+        if daily_r3 is None and facts.previous_day and facts.previous_day.pivots:
+            daily_r3 = facts.previous_day.pivots.get("R3")
+        if (
+            daily_r3 is None
+            or previous["close"] > level
+            or current["close"] <= level
+            or current["close"] <= float(daily_r3)
+            or current["close"] <= current["open"]
+        ):
             return None
         if facts.average_candle_size is None or not volume_present(
             current,
