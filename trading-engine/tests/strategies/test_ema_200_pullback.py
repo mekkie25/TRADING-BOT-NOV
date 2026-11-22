@@ -135,6 +135,52 @@ class Ema200PullbackStrategyTests(unittest.TestCase):
         # The engine uses fixed_stop mode now, bumped to 100
         self.assertAlmostEqual(sig.stop_distance, 100.0, delta=5.0)
 
+    # ----- Stop and target settings (AGENTS.md rules 10 and 11) -----
+
+    BUY_ROWS = [
+        (101.0, 101.5, 99.5, 100.0),
+        (100.0, 101.5, 99.5, 101.5),
+    ]
+
+    def test_default_stop_and_target_are_fixed_50_and_50(self):
+        sig = evaluate(make_test_candles(self.BUY_ROWS), make_test_facts(100.0), self.spec)
+        self.assertEqual(sig.sl_mode, "fixed")
+        self.assertEqual(sig.tp_mode, "fixed")
+        self.assertEqual(sig.stop_distance, 50.0)
+        self.assertEqual(sig.target_distance, 50.0)
+
+    def test_fixed_stop_and_target_can_be_changed(self):
+        sig = evaluate(
+            make_test_candles(self.BUY_ROWS),
+            make_test_facts(100.0),
+            self.spec,
+            parameters={"fixed_stop": 30, "fixed_target": 90},
+        )
+        self.assertEqual(sig.stop_distance, 30.0)
+        self.assertEqual(sig.target_distance, 90.0)
+
+    def test_volatility_scaled_mode_is_still_selectable(self):
+        sig = evaluate(
+            make_test_candles(self.BUY_ROWS),
+            make_test_facts(100.0),
+            self.spec,
+            parameters={"sl_mode": "volatility_scaled", "tp_mode": "volatility_scaled"},
+        )
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.sl_mode, "volatility_scaled")
+        # Average candle size 2.0: stop 1.5 times, target 3.0 times.
+        self.assertAlmostEqual(sig.stop_distance, 3.0)
+        self.assertAlmostEqual(sig.target_distance, 6.0)
+
+    def test_parameters_passed_in_are_not_changed(self):
+        parameters = {"atr": 4.5}
+        evaluate(make_test_candles(self.BUY_ROWS), make_test_facts(100.0), self.spec, parameters)
+        self.assertEqual(parameters, {"atr": 4.5})
+
+    def test_no_signal_when_the_body_is_not_solid(self):
+        rows = [(101.0, 101.5, 99.5, 100.0), (100.0, 102.0, 98.0, 100.6)]
+        self.assertIsNone(evaluate(make_test_candles(rows), make_test_facts(100.0), self.spec))
+
 
 if __name__ == "__main__":
     unittest.main()

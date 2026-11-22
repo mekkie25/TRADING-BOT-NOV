@@ -1,4 +1,22 @@
-"""Conditional 5-minute 200 EMA pullback with a body-close confirmation."""
+"""Conditional 5-minute 200 EMA pullback with a body-close confirmation (spec Section 3.17).
+
+Entry (on a closed candle, never a pending order): price is above (buy) or below
+(sell) the 200 EMA, a candle or the one before it tested the EMA, and the latest
+candle closes away from it with a solid body (at least 60% of its range).
+
+Defaults follow the spec as starting values: fixed 50 stop (100 when the caller
+passes atr above 4.0) and fixed 50 target. The caller can change them with
+fixed_stop and fixed_target, or pick sl_mode / tp_mode "volatility_scaled"
+(AGENTS.md rule 11). A structural stop is not offered: the spec gives none.
+
+Known gaps against the spec, left as they are:
+  * The pullback is tested against the 200 EMA only, not the Daily Flip or POC.
+  * "Clearly above or below" the EMA is not measured; a close on the right side counts.
+  * The Daily R1/R2 target option is not built.
+  * The 60% body size is fixed in the code.
+  * The 200 EMA comes from the facts, and the code does not check it is a 5M EMA.
+  * Fewer than two trades a day is a risk rule, not checked here.
+"""
 
 from typing import Dict, Optional
 
@@ -16,7 +34,7 @@ def evaluate(
     instrument_spec: InstrumentSpec,
     parameters: Optional[Dict[str, object]] = None,
 ) -> Optional[Signal]:
-    settings = parameters or {}
+    settings = dict(parameters or {})  # a copy: the caller's dict is never changed
     
     if len(candles) < 2 or facts.ema_200 is None:
         return None
@@ -64,10 +82,10 @@ def evaluate(
     fixed_stop_val = float(settings.get("fixed_stop", fixed_stop_val))
     fixed_target_val = float(settings.get("fixed_target", 50.0))
 
-    # Force the engine to use fixed pip mode instead of the default ATR scaled mode
-    settings["sl_mode"] = "fixed"
+    # Spec defaults are fixed pips, but the caller may still choose another mode.
+    settings.setdefault("sl_mode", "fixed")
     settings["fixed_stop"] = fixed_stop_val
-    settings["tp_mode"] = "fixed"
+    settings.setdefault("tp_mode", "fixed")
     settings["fixed_target"] = fixed_target_val
 
     return make_signal(
