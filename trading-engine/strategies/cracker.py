@@ -1,4 +1,24 @@
-"""Call-based Cracker strategy; direction and levels are caller-supplied."""
+"""Call-based Cracker (spec Section 3.6, version B); direction and levels are caller-supplied.
+
+The daily call (buy or sell) and the two price levels are given by the caller.
+After the open, a candle that closes through the first level tapped, in the
+call's direction, is the entry. The signal fires on that close; there are no
+pending orders (AGENTS.md rule 10). This module only reports a signal.
+
+Defaults follow the spec as starting values: fixed 60 stop and fixed 60 target
+(1:1). Use fixed_target 120 for 1:2. The structural stop (the entry candle's
+extreme) and the previous-day equilibrium target stay selectable with sl_mode
+and tp_mode "structural", and so does the volatility-scaled mode
+(AGENTS.md rule 11).
+
+What is NOT here, on purpose:
+  * Version A ("Teemo" joke version): the spec says do not use it.
+  * Version C (wick) and version D (barrier): the spec's rules for them are unclear.
+  * End-of-month, bank-holiday and CPI/NFP skips: the news filter is not built
+    and the spec does not say which days count as end of month.
+  * Break-even at 80%, the 90-second exit itself, max two trades a day:
+    trade management and risk rules. The 90 seconds is passed on as time_limit_seconds.
+"""
 
 from datetime import timedelta
 from typing import Dict, Optional
@@ -17,7 +37,10 @@ def evaluate(
     instrument_spec: InstrumentSpec,
     parameters: Optional[Dict[str, object]] = None,
 ) -> Optional[Signal]:
-    settings = parameters or {}
+    # Spec defaults: fixed stop and target. Callers can still choose another mode.
+    settings = dict(parameters or {})
+    settings.setdefault("sl_mode", "fixed")
+    settings.setdefault("tp_mode", "fixed")
     call = str(settings.get("call_direction", "")).lower()
     levels = settings.get("call_levels")
     if call not in ("buy", "sell") or not isinstance(levels, (list, tuple)) or len(levels) != 2:
@@ -73,7 +96,7 @@ def evaluate(
         candles=candles,
         facts=facts,
         instrument_spec=instrument_spec,
-        parameters=parameters,
+        parameters=settings,
         structural_stop_price=stop,
         structural_target_price=target,
         default_stop=60,

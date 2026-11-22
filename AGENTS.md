@@ -58,6 +58,7 @@ The offline EURUSD H1 backtest prototype is implemented but not verified; its re
 8. Never open or print .env or any key.
 9. When finished, add a line to docs/DECISIONS.md.
 10. No pending orders. Never use buy stops, sell stops, limit orders or any order placed ahead of price. Every entry is taken only after a candle has CLOSED and the entry conditions are confirmed on that close, because a wick through a level can be a liquidity grab. Where the master file describes a stop or pending entry (3.5 Power Ranger step 4, and 3.21 Types 3 to 5), the master file stays unchanged, but the code enters on the confirming candle close instead. This rule overrides strategy build rule 5 for pending-order variants: do not build them. Tell me wherever a strategy differs from the master file because of this rule.
+11. Stops and targets are starting values. The fixed numbers in the master file (for example Cracker 60, Power Ranger 40 and 120) are only defaults. Every strategy keeps its stop and target tunable, and the volatility-scaled mode (a multiple of the average candle range, with the average daily range as a second yardstick, master file Sections 11.1 and 12) must stay selectable. The long-term goal is to set stops and targets from current volatility, so a target is reachable and a stop is not squeezed by normal movement, whatever the year or the instrument. Never hard-code a stop or target number that cannot be changed.
 
 ## Where things live today
 (We move toward the cycle layout ONE piece at a time, never all at once.)
