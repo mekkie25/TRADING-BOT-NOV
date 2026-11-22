@@ -1,8 +1,13 @@
-"""Apply explicitly supplied account-risk limits before execution."""
+"""Apply explicitly supplied account-risk limits before execution.
+
+Risk per trade and daily loss now come from account-size TIERS. A small account
+gets different limits from a large one, and every tier number is a setting.
+This module only reports PASS, FAIL or UNKNOWN. It never places orders.
+"""
 
 import math
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Sequence, Tuple
 
 
 RiskStatus = Literal["PASS", "FAIL", "UNKNOWN"]
@@ -43,19 +48,34 @@ class RiskAssessment:
     summary: str
 
 
+@dataclass(frozen=True)
+class RiskTier:
+    """One account-size band. min_balance is in account currency (dollars)."""
+
+    name: str
+    min_balance: float
+    max_risk_per_trade_percent: float
+    max_daily_loss_percent: float
+
+
+# PLACEHOLDER VALUES. These are starting points for the owner to change, not
+# recommendations. Balances are in account currency (dollars).
+DEFAULT_RISK_TIERS: Tuple[RiskTier, ...] = (
+    RiskTier("micro", 0.0, 10.0, 20.0),
+    RiskTier("small", 100.0, 5.0, 10.0),
+    RiskTier("medium", 1000.0, 2.0, 5.0),
+    RiskTier("large", 10000.0, 1.0, 3.0),
+)
+
+
+def _validate_percent(name: str, value: float) -> None:
+    if not math.isfinite(value) or not 0 < value <= 100:
+        raise ValueError(f"{name} must be greater than 0 and no more than 100.")
+
+
 def _validate_limits(limits: RiskLimits) -> None:
-    percent_limits = {
-        "max_risk_per_trade_percent": limits.max_risk_per_trade_percent,
-        "max_daily_loss_percent": limits.max_daily_loss_percent,
-    }
-    for name, value in percent_limits.items():
-        if not math.isfinite(value) or not 0 < value <= 100:
-            raise ValueError(f"{name} must be greater than 0 and no more than 100.")
-    if limits.max_risk_per_trade_percent > 2.0:
-        raise ValueError(
-            "max_risk_per_trade_percent must not exceed the master-strategy "
-            "maximum of 2."
-        )
+    _validate_percent("max_risk_per_trade_percent", limits.max_risk_per_trade_percent)
+    _validate_percent("max_daily_loss_percent", limits.max_daily_loss_percent)
     if (
         not isinstance(limits.max_daily_trades, int)
         or isinstance(limits.max_daily_trades, bool)
@@ -72,6 +92,117 @@ def _validate_limits(limits: RiskLimits) -> None:
         or limits.max_open_positions < 1
     ):
         raise ValueError("max_open_positions must be a positive integer.")
+
+
+def validate_tiers(tiers: Sequence[RiskTier]) -> None:
+    """Raise ValueError unless the tiers are a usable ladder starting at zero."""
+    if not tiers:
+        raise ValueError("At least one risk tier is required.")
+    names = set()
+    previous_minimum = None
+    for tier in tiers:
+        if not isinstance(tier.name, str) or not tier.name.strip():
+            raise ValueError("Every risk tier needs a name.")
+        if tier.name in names:
+            raise ValueError(f"Duplicate risk tier name: {tier.name}.")
+        names.add(tier.name)
+        if not math.isfinite(tier.min_balance) or tier.min_balance < 0:
+            raise ValueError(f"Tier {tier.name}: min_balance must be zero or more.")
+        _validate_percent(
+            f"Tier {tier.name} max_risk_per_trade_percent",
+            tier.max_risk_per_trade_percent,
+        )
+        _validate_percent(
+            f"Tier {tier.name} max_daily_loss_percent",
+            tier.max_daily_loss_percent,
+        )
+        if previous_minimum is None:
+            if tier.min_balance != 0:
+                raise ValueError("The first risk tier must start at a balance of 0.")
+        elif tier.min_balance <= previous_minimum:
+            raise ValueError("Risk tiers must go up in balance, smallest first.")
+        previous_minimum = tier.min_balance
+
+
+def tier_for_balance(
+    balance: float,
+    tiers: Sequence[RiskTier] = DEFAULT_RISK_TIERS,
+) -> RiskTier:
+    """Return the tier whose band contains this balance (in account currency)."""
+    if not math.isfinite(balance) or balance <= 0:
+        raise ValueError("balance must be a positive finite amount.")
+    validate_tiers(tiers)
+    chosen = tiers[0]
+    for tier in tiers:
+        if balance >= tier.min_balance:
+            chosen = tier
+    return chosen
+
+
+def limits_for_balance(
+    balance: float,
+    tiers: Sequence[RiskTier] = DEFAULT_RISK_TIERS,
+    max_daily_trades: int = 2,
+    max_open_positions: int = 1,
+) -> RiskLimits:
+    """Build the risk limits for an account of this size."""
+    tier = tier_for_balance(balance, tiers)
+    limits = RiskLimits(
+        max_risk_per_trade_percent=tier.max_risk_per_trade_percent,
+        max_daily_loss_percent=tier.max_daily_loss_percent,
+        max_daily_trades=max_daily_trades,
+        max_open_positions=max_open_positions,
+    )
+    _validate_limits(limits)
+    return limits
+
+
+def check_minimum_lot_affordable(
+    equity: float,
+    loss_at_minimum_lot_cash: float,
+    max_risk_per_trade_percent: float,
+) -> RiskCheck:
+    """Can this account afford even the smallest trade the broker allows?
+
+    loss_at_minimum_lot_cash is the cash lost if the stop is hit at the smallest
+    allowed lot, in account currency. The caller works this out from the broker
+    specs and the stop distance.
+    """
+    for name, value in (
+        ("equity", equity),
+        ("loss_at_minimum_lot_cash", loss_at_minimum_lot_cash),
+    ):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive finite amount.")
+    _validate_percent("max_risk_per_trade_percent", max_risk_per_trade_percent)
+    risk_percent = loss_at_minimum_lot_cash / equity * 100
+    if risk_percent > max_risk_per_trade_percent:
+        return RiskCheck(
+            "Minimum lot affordable",
+            "FAIL",
+            (
+                f"The smallest allowed trade already risks {risk_percent:.2f}% of "
+                f"equity; this account's limit is {max_risk_per_trade_percent:.2f}%. "
+                "Skip this trade."
+            ),
+        )
+    return RiskCheck(
+        "Minimum lot affordable",
+        "PASS",
+        (
+            f"The smallest allowed trade risks {risk_percent:.2f}% of equity; "
+            f"limit is {max_risk_per_trade_percent:.2f}%."
+        ),
+    )
+
+
+def rand_to_dollars(amount_rand: float, rand_per_dollar: float) -> float:
+    """Convert rand to dollars. The caller supplies the current rate."""
+    if not math.isfinite(amount_rand) or amount_rand < 0:
+        raise ValueError("amount_rand must be zero or more.")
+    if not math.isfinite(rand_per_dollar) or rand_per_dollar <= 0:
+        raise ValueError("rand_per_dollar must be a positive finite rate.")
+    return amount_rand / rand_per_dollar
 
 
 def assess_trade_risk(
