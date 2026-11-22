@@ -57,6 +57,7 @@ The offline EURUSD H1 backtest prototype is implemented but not verified; its re
 7. Give every changed file as ONE complete file. No partial snippets.
 8. Never open or print .env or any key.
 9. When finished, add a line to docs/DECISIONS.md.
+10. No pending orders. Never use buy stops, sell stops, limit orders or any order placed ahead of price. Every entry is taken only after a candle has CLOSED and the entry conditions are confirmed on that close, because a wick through a level can be a liquidity grab. Where the master file describes a stop or pending entry (3.5 Power Ranger step 4, and 3.21 Types 3 to 5), the master file stays unchanged, but the code enters on the confirming candle close instead. This rule overrides strategy build rule 5 for pending-order variants: do not build them. Tell me wherever a strategy differs from the master file because of this rule.
 
 ## Where things live today
 (We move toward the cycle layout ONE piece at a time, never all at once.)
