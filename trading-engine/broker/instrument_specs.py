@@ -36,7 +36,11 @@ class InstrumentSpec:
 
 DEFAULT_INSTRUMENT_SPECS: Dict[str, InstrumentSpec] = {
     "EURUSD": InstrumentSpec("EURUSD", pip_size=0.0001),
+    "GBPUSD": InstrumentSpec("GBPUSD", pip_size=0.0001),
+    "USDJPY": InstrumentSpec("USDJPY", pip_size=0.01),
     "XAUUSD": InstrumentSpec("XAUUSD", pip_size=0.10),
+    # BTCUSD: 1 point = 1.00 of price (a 500-point stop is 500 dollars).
+    "BTCUSD": InstrumentSpec("BTCUSD", point_size=1.0),
     "US30": InstrumentSpec("US30", point_size=1.0),
     "NAS100": InstrumentSpec("NAS100", point_size=1.0),
     "NASDAQ": InstrumentSpec("NASDAQ", point_size=1.0),
