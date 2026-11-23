@@ -7,6 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
 import pandas as pd
 from broker.ctrader_symbol_specs import build_ctrader_forex_spec
 from broker.lot_sizing import calculate_lot_size
@@ -225,7 +226,7 @@ def get_market_snapshot(symbol: str = "EURUSD"):
                 "first completed report is generated from an M1 candle."
             ),
         )
-    return jsonable_encoder(snapshot)
+    return jsonable_encoder(snapshot, custom_encoder={np.generic: lambda value: value.item()})
 
 @app.get("/api/strategies")
 def get_strategies():
