@@ -11,6 +11,7 @@ import pandas as pd
 from broker.ctrader_symbol_specs import build_ctrader_forex_spec
 from broker.lot_sizing import calculate_lot_size
 from data.data_quality import inspect_candle_data
+from data.live_feed_hub import LiveFeedHub
 from data.live_feed_manager import live_feed_manager
 from engine.simulator import BacktestConfig as SimulatorConfig
 from engine.simulator import BacktestSimulator
@@ -18,15 +19,41 @@ from strategies.validation_trivial import ValidationTrivial
 from pydantic import BaseModel, Field
 import uuid
 
+# The live feed for all watched instruments. EURUSD is the primary feed and the
+# only one that reads the account balance.
+live_feed_hub = LiveFeedHub(live_feed_manager)
+
+PAIR_DISPLAY_NAMES = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "XAUUSD": "XAU/USD",
+    "BTCUSD": "BTC/USD",
+    "DAX": "DAX (German 30)",
+    "US30": "US30",
+    "NAS100": "NAS100",
+}
+
+
+def _feed_for(symbol: str):
+    try:
+        return live_feed_hub.get(symbol)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown instrument {symbol}. Available: {', '.join(live_feed_hub.symbols)}.",
+        ) from None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.live_feed_manager = live_feed_manager
-    live_feed_manager.start()
+    app.state.live_feed_hub = live_feed_hub
+    live_feed_hub.start()
     try:
         yield
     finally:
-        live_feed_manager.stop()
+        live_feed_hub.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -66,6 +93,7 @@ class LotSizingRequest(BaseModel):
     entryPrice: float = Field(gt=0)
     stopLossPrice: float = Field(gt=0)
     riskPercent: float = Field(gt=0, le=100)
+    symbol: str = "EURUSD"
 
 
 # ==============================================================================
@@ -107,7 +135,7 @@ def get_live_lot_size(request: LotSizingRequest):
         )
 
     account_facts = live_feed_manager.get_account_facts()
-    symbol_info = live_feed_manager.get_symbol_info()
+    symbol_info = _feed_for(request.symbol).get_symbol_info()
     if account_facts is None or symbol_info is None:
         raise HTTPException(
             status_code=503,
@@ -166,17 +194,25 @@ def get_settings():
 
 @app.get("/api/market/pairs")
 def get_pairs():
-    return [{"symbol": "EURUSD", "displayName": "EUR/USD"}]
+    return [
+        {"symbol": symbol, "displayName": PAIR_DISPLAY_NAMES.get(symbol, symbol)}
+        for symbol in live_feed_hub.symbols
+    ]
 
 @app.get("/api/market/live")
-def get_live_market_data():
-    return live_feed_manager.get_snapshot()
+def get_live_market_data(symbol: str = "EURUSD"):
+    return _feed_for(symbol).get_snapshot()
+
+@app.get("/api/market/live/all")
+def get_live_market_data_all():
+    return live_feed_hub.get_all_snapshots()
 
 @app.get("/api/market/snapshot")
-def get_market_snapshot():
-    snapshot = live_feed_manager.get_market_snapshot()
+def get_market_snapshot(symbol: str = "EURUSD"):
+    feed = _feed_for(symbol)
+    snapshot = feed.get_market_snapshot()
     if snapshot is None:
-        snapshot_error = live_feed_manager.get_market_snapshot_error()
+        snapshot_error = feed.get_market_snapshot_error()
         if snapshot_error is not None:
             raise HTTPException(
                 status_code=503,

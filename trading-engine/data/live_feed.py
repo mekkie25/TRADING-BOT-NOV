@@ -107,6 +107,7 @@ class LiveCTraderFeed:
         on_account_facts: Optional[AccountCallback] = None,
         on_symbol_info: Optional[SymbolInfoCallback] = None,
         on_status: Optional[StatusCallback] = None,
+        track_account: bool = True,
     ):
         self.client_id = self._required_environment_value("CTRADER_CLIENT_ID")
         self.client_secret = self._required_environment_value("CTRADER_SECRET")
@@ -119,7 +120,10 @@ class LiveCTraderFeed:
         if not symbol_name.strip():
             raise ValueError("symbol_name must not be empty.")
 
+        # symbol_name is our own name for the instrument (for example DAX).
+        # The broker may call it something else (for example GER40).
         self.symbol_name = symbol_name.strip()
+        self.track_account = track_account
         self.symbol_id: Optional[int] = None
         self.connection_state = "disconnected"
         self.on_quote = on_quote
@@ -217,9 +221,10 @@ class LiveCTraderFeed:
             request = ProtoOASymbolsListReq()
             request.ctidTraderAccountId = self.account_id
             client.send(request)
-            self._request_account_facts()
-            self._account_refresh = LoopingCall(self._request_account_facts)
-            self._account_refresh.start(ACCOUNT_FACTS_REFRESH_SECONDS, now=False)
+            if self.track_account:
+                self._request_account_facts()
+                self._account_refresh = LoopingCall(self._request_account_facts)
+                self._account_refresh.start(ACCOUNT_FACTS_REFRESH_SECONDS, now=False)
             self._set_connection_state("authenticated", "Account authenticated.")
         elif payload_type == ProtoOATraderRes().payloadType:
             self._on_trader_response(Protobuf.extract(message))
@@ -350,11 +355,25 @@ class LiveCTraderFeed:
             )
         )
 
+    def _find_symbol_by_alias(self, symbols):
+        """Match our instrument name to the broker's name (for example DAX to GER40)."""
+        from data.downloader import resolve_symbols
+
+        broker_names = {item.symbolName: item.symbolId for item in symbols}
+        wanted = self.symbol_name.upper()
+        resolved, _missing = resolve_symbols(broker_names, [wanted])
+        hit = resolved.get(wanted)
+        if hit is None:
+            return None
+        return next((item for item in symbols if item.symbolId == hit[1]), None)
+
     def _on_symbols_list(self, client, response) -> None:
         symbol = next(
             (item for item in response.symbol if item.symbolName == self.symbol_name),
             None,
         )
+        if symbol is None:
+            symbol = self._find_symbol_by_alias(response.symbol)
         if symbol is None:
             self._set_connection_state(
                 "error",
@@ -609,6 +628,15 @@ class LiveCTraderFeed:
 
         self._active_candles[timeframe] = candle
         return active_candle
+
+    def connect(self) -> None:
+        """Start this feed on a Twisted reactor that is already running.
+
+        Used when several feeds share one reactor. Must be called from the reactor
+        thread (for example through reactor.callFromThread).
+        """
+        self._set_connection_state("connecting", f"Starting cTrader feed for {self.symbol_name}.")
+        self.client.startService()
 
     def start(self, install_signal_handlers: bool = True) -> None:
         if reactor.running:

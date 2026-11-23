@@ -24,10 +24,15 @@ from market.market_snapshot import build_market_snapshot
 logger = logging.getLogger(__name__)
 ACCOUNT_FACTS_MAX_AGE_SECONDS = ACCOUNT_FACTS_REFRESH_SECONDS * 2
 CANDLE_HISTORY_LIMIT = 10_080
+SHARED_REACTOR_WAIT_SECONDS = 15
 
 
 class LiveFeedManager:
-    def __init__(self) -> None:
+    def __init__(self, symbol_name: str = "EURUSD", track_account: bool = True) -> None:
+        if not symbol_name or not symbol_name.strip():
+            raise ValueError("symbol_name must not be empty.")
+        self._symbol_name = symbol_name.strip().upper()
+        self._track_account = track_account
         configured_environment = os.getenv("CTRADER_ENV", "demo").strip().lower()
         self._environment = (
             configured_environment.title()
@@ -54,46 +59,58 @@ class LiveFeedManager:
         self._thread: Optional[Thread] = None
         self._start_attempted = False
 
-    def start(self) -> None:
+    @property
+    def symbol_name(self) -> str:
+        return self._symbol_name
+
+    def _prepare_feed(self) -> Optional[LiveCTraderFeed]:
+        """Check the settings and build the feed. Returns None when it cannot or must not start."""
         with self._lock:
             if self._start_attempted:
-                return
+                return None
             self._start_attempted = True
 
         enabled = os.getenv("CTRADER_FEED_ENABLED", "true").strip().lower()
         if enabled == "false":
             self._set_status("Disconnected", "cTrader feed disabled by configuration.")
-            return
+            return None
         if enabled != "true":
             self._set_status(
                 "Error",
                 "CTRADER_FEED_ENABLED must be either 'true' or 'false'.",
             )
-            return
+            return None
         if self._environment == "Unknown":
             self._set_status(
                 "Error",
                 "CTRADER_ENV must be either 'demo' or 'live'.",
             )
-            return
+            return None
 
         try:
-            feed = LiveCTraderFeed(
-                symbol_name="EURUSD",
+            return LiveCTraderFeed(
+                symbol_name=self._symbol_name,
                 on_quote=self._record_quote,
                 on_closed_candle=self._record_closed_candle,
                 on_account_facts=self._record_account_facts,
                 on_symbol_info=self._record_symbol_info,
                 on_status=self._record_feed_status,
+                track_account=self._track_account,
             )
         except ValueError as error:
             self._set_status("Error", str(error))
+            return None
+
+    def start(self) -> None:
+        """Start this feed and run the Twisted reactor on its own thread."""
+        feed = self._prepare_feed()
+        if feed is None:
             return
 
         thread = Thread(
             target=self._run_feed,
             args=(feed,),
-            name=f"ctrader-{self._environment.lower()}-feed",
+            name=f"ctrader-{self._environment.lower()}-{self._symbol_name}-feed",
             daemon=True,
         )
         with self._lock:
@@ -102,6 +119,34 @@ class LiveFeedManager:
             self._connection_state = "Connecting"
             self._message = f"Starting the cTrader {self._environment} market-data feed."
         thread.start()
+
+    def start_attached(self, owner: "LiveFeedManager") -> None:
+        """Start this feed on the reactor that the owner manager already runs."""
+        feed = self._prepare_feed()
+        if feed is None:
+            return
+
+        thread = Thread(
+            target=self._connect_when_ready,
+            args=(feed, owner),
+            name=f"ctrader-{self._environment.lower()}-{self._symbol_name}-connect",
+            daemon=True,
+        )
+        with self._lock:
+            self._feed = feed
+            self._thread = thread
+            self._connection_state = "Connecting"
+            self._message = f"Starting the cTrader {self._environment} market-data feed."
+        thread.start()
+
+    def _connect_when_ready(self, feed: LiveCTraderFeed, owner: "LiveFeedManager") -> None:
+        if not owner._reactor_ready.wait(timeout=SHARED_REACTOR_WAIT_SECONDS):
+            self._set_status(
+                "Error",
+                "The shared cTrader feed engine did not become ready.",
+            )
+            return
+        reactor.callFromThread(feed.connect)
 
     def stop(self) -> None:
         with self._lock:
@@ -122,6 +167,17 @@ class LiveFeedManager:
                     "The cTrader feed reactor did not become ready.",
                 )
 
+        self._shutdown_snapshot_executor()
+
+    def stop_attached(self) -> None:
+        """Stop a feed that shares another manager's reactor. The reactor keeps running."""
+        with self._lock:
+            feed = self._feed
+        if feed is not None and reactor.running:
+            reactor.callFromThread(feed.client.stopService)
+        self._shutdown_snapshot_executor()
+
+    def _shutdown_snapshot_executor(self) -> None:
         with self._lock:
             snapshot_executor = self._market_snapshot_executor
         if snapshot_executor is not None:
@@ -134,7 +190,7 @@ class LiveFeedManager:
             return {
                 "connectionState": self._connection_state,
                 "environment": self._environment,
-                "symbol": "EURUSD",
+                "symbol": self._symbol_name,
                 "message": self._message,
                 "quote": (
                     {
@@ -287,7 +343,7 @@ class LiveFeedManager:
                 if self._market_snapshot_executor is None:
                     self._market_snapshot_executor = ThreadPoolExecutor(
                         max_workers=1,
-                        thread_name_prefix="market-snapshot",
+                        thread_name_prefix=f"market-snapshot-{self._symbol_name}",
                     )
                 snapshot_executor = self._market_snapshot_executor
                 self._market_snapshot_update_complete.clear()
