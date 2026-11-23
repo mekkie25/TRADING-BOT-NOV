@@ -24,7 +24,6 @@ from market.market_snapshot import build_market_snapshot
 logger = logging.getLogger(__name__)
 ACCOUNT_FACTS_MAX_AGE_SECONDS = ACCOUNT_FACTS_REFRESH_SECONDS * 2
 CANDLE_HISTORY_LIMIT = 10_080
-SHARED_REACTOR_WAIT_SECONDS = 15
 
 
 class LiveFeedManager:
@@ -58,12 +57,22 @@ class LiveFeedManager:
         self._feed: Optional[LiveCTraderFeed] = None
         self._thread: Optional[Thread] = None
         self._start_attempted = False
+        self._shared_managers: list["LiveFeedManager"] = []
 
     @property
     def symbol_name(self) -> str:
         return self._symbol_name
 
-    def _prepare_feed(self) -> Optional[LiveCTraderFeed]:
+    def share_connection_with(self, other: "LiveFeedManager") -> None:
+        """Let another instrument ride on this manager's cTrader connection.
+
+        Call this before start(). cTrader allows one login per account, so every
+        instrument uses the connection of the manager that is started.
+        """
+        if other is not self and other not in self._shared_managers:
+            self._shared_managers.append(other)
+
+    def _prepare_feed(self, parent: Optional[LiveCTraderFeed] = None) -> Optional[LiveCTraderFeed]:
         """Check the settings and build the feed. Returns None when it cannot or must not start."""
         with self._lock:
             if self._start_attempted:
@@ -96,6 +105,7 @@ class LiveFeedManager:
                 on_symbol_info=self._record_symbol_info,
                 on_status=self._record_feed_status,
                 track_account=self._track_account,
+                parent=parent,
             )
         except ValueError as error:
             self._set_status("Error", str(error))
@@ -105,7 +115,14 @@ class LiveFeedManager:
         """Start this feed and run the Twisted reactor on its own thread."""
         feed = self._prepare_feed()
         if feed is None:
+            # Nothing runs, so the shared instruments show the same reason.
+            with self._lock:
+                state, message = self._connection_state, self._message
+            for other in self._shared_managers:
+                other._set_status(state, message)
             return
+        for other in self._shared_managers:
+            other._join_connection(feed)
 
         thread = Thread(
             target=self._run_feed,
@@ -120,33 +137,15 @@ class LiveFeedManager:
             self._message = f"Starting the cTrader {self._environment} market-data feed."
         thread.start()
 
-    def start_attached(self, owner: "LiveFeedManager") -> None:
-        """Start this feed on the reactor that the owner manager already runs."""
-        feed = self._prepare_feed()
+    def _join_connection(self, parent: LiveCTraderFeed) -> None:
+        """Use the connection of another manager's feed. No thread and no login of its own."""
+        feed = self._prepare_feed(parent=parent)
         if feed is None:
             return
-
-        thread = Thread(
-            target=self._connect_when_ready,
-            args=(feed, owner),
-            name=f"ctrader-{self._environment.lower()}-{self._symbol_name}-connect",
-            daemon=True,
-        )
         with self._lock:
             self._feed = feed
-            self._thread = thread
             self._connection_state = "Connecting"
             self._message = f"Starting the cTrader {self._environment} market-data feed."
-        thread.start()
-
-    def _connect_when_ready(self, feed: LiveCTraderFeed, owner: "LiveFeedManager") -> None:
-        if not owner._reactor_ready.wait(timeout=SHARED_REACTOR_WAIT_SECONDS):
-            self._set_status(
-                "Error",
-                "The shared cTrader feed engine did not become ready.",
-            )
-            return
-        reactor.callFromThread(feed.connect)
 
     def stop(self) -> None:
         with self._lock:
@@ -167,14 +166,6 @@ class LiveFeedManager:
                     "The cTrader feed reactor did not become ready.",
                 )
 
-        self._shutdown_snapshot_executor()
-
-    def stop_attached(self) -> None:
-        """Stop a feed that shares another manager's reactor. The reactor keeps running."""
-        with self._lock:
-            feed = self._feed
-        if feed is not None and reactor.running:
-            reactor.callFromThread(feed.client.stopService)
         self._shutdown_snapshot_executor()
 
     def _shutdown_snapshot_executor(self) -> None:

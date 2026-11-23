@@ -1,9 +1,11 @@
-"""Runs the live cTrader feed for several instruments on one shared Twisted engine.
+"""Runs the live cTrader feed for all watched instruments on ONE connection.
 
-The primary manager (EURUSD) runs the engine and is the only one that reads the
-account balance. Every other instrument gets its own manager and its own
-connection, started on the same engine. Each manager keeps its own quote,
-candles and market snapshot, so the instruments never mix.
+cTrader does not accept the same account logged in on several connections, so
+EURUSD (the primary manager) opens the single connection and logs in once. The
+other instruments ride on it: the feed asks cTrader for each instrument and hands
+every quote and candle to the right manager. Each manager keeps its own quote,
+candles and market snapshot, so the instruments never mix. Only EURUSD reads the
+account balance.
 """
 
 from typing import Dict, Iterable, List
@@ -33,7 +35,9 @@ class LiveFeedHub:
         for name in symbols:
             key = name.strip().upper()
             if key not in self._managers:
-                self._managers[key] = LiveFeedManager(symbol_name=key, track_account=False)
+                manager = LiveFeedManager(symbol_name=key, track_account=False)
+                self._managers[key] = manager
+                primary.share_connection_with(manager)
 
     @property
     def symbols(self) -> List[str]:
@@ -45,14 +49,11 @@ class LiveFeedHub:
 
     def start(self) -> None:
         self.primary.start()
-        for manager in self._managers.values():
-            if manager is not self.primary:
-                manager.start_attached(self.primary)
 
     def stop(self) -> None:
         for manager in self._managers.values():
             if manager is not self.primary:
-                manager.stop_attached()
+                manager.stop()
         self.primary.stop()
 
     def get_all_snapshots(self) -> Dict[str, dict]:

@@ -1,4 +1,10 @@
-"""Data-only cTrader feed for quotes and completed M5 candles."""
+"""Data-only cTrader feed for quotes and completed M1/M5 candles.
+
+One feed normally owns one cTrader connection. Extra instruments can share that
+same connection: build them with parent=<the first feed>. The parent then logs in
+once, asks for every instrument and hands each message to the right instrument.
+cTrader rejects several logins of the same account, so this keeps it to one.
+"""
 
 import logging
 import os
@@ -108,6 +114,7 @@ class LiveCTraderFeed:
         on_symbol_info: Optional[SymbolInfoCallback] = None,
         on_status: Optional[StatusCallback] = None,
         track_account: bool = True,
+        parent: Optional["LiveCTraderFeed"] = None,
     ):
         self.client_id = self._required_environment_value("CTRADER_CLIENT_ID")
         self.client_secret = self._required_environment_value("CTRADER_SECRET")
@@ -124,6 +131,11 @@ class LiveCTraderFeed:
         # The broker may call it something else (for example GER40).
         self.symbol_name = symbol_name.strip()
         self.track_account = track_account
+        self._parent = parent
+        self._children: list["LiveCTraderFeed"] = []
+        self._unavailable = False
+        self._subscription_requests_sent = 0
+        self._subscription_responses_received = 0
         self.symbol_id: Optional[int] = None
         self.connection_state = "disconnected"
         self.on_quote = on_quote
@@ -145,6 +157,12 @@ class LiveCTraderFeed:
         self._account_balance_received_at: Optional[datetime] = None
         self._account_net_unrealized_pnl: Optional[float] = None
         self._account_pnl_received_at: Optional[datetime] = None
+
+        if parent is not None:
+            # Shares the parent's connection: no client of its own.
+            self.client = parent.client
+            parent._children.append(self)
+            return
 
         host = (
             EndPoints.PROTOBUF_DEMO_HOST
@@ -174,12 +192,58 @@ class LiveCTraderFeed:
             raise ValueError("CTRADER_ACCOUNT_ID must be greater than zero.")
         return account_id
 
-    def _set_connection_state(self, state: str, message: str) -> None:
+    def _group(self) -> list["LiveCTraderFeed"]:
+        """This feed and every instrument that shares its connection."""
+        return [self, *self._children]
+
+    def _set_connection_state(
+        self, state: str, message: str, broadcast: bool = True
+    ) -> None:
         self.connection_state = state
         level = logging.ERROR if state == "error" else logging.INFO
         logger.log(level, message)
         if self.on_status is not None:
             self.on_status(state, message)
+        if broadcast:
+            for child in self._children:
+                child._relay_connection_state(state, message)
+
+    def _relay_connection_state(self, state: str, message: str) -> None:
+        """Pass the shared connection's state to an instrument that rides on it."""
+        if self._unavailable:
+            return
+        self.connection_state = state
+        if self.on_status is not None:
+            self.on_status(state, message)
+
+    def _send(self, client, request, instrument: Optional[str] = None) -> None:
+        """Send a request. A request nobody answers is logged, not left unhandled."""
+        result = client.send(request)
+        add_errback = getattr(result, "addErrback", None)
+        if callable(add_errback):
+            request_name = request.DESCRIPTOR.name
+            add_errback(
+                lambda failure: self._on_request_failed(request_name, instrument, failure)
+            )
+
+    @staticmethod
+    def _on_request_failed(request_name: str, instrument: Optional[str], failure) -> None:
+        logger.warning(
+            "cTrader did not answer %s%s in time (%s).",
+            request_name,
+            f" for {instrument}" if instrument else "",
+            failure.type.__name__,
+        )
+        return None
+
+    def _mark_receiving_data(self) -> None:
+        """First real data for this instrument proves its subscription works."""
+        if self.connection_state == "subscribing":
+            self._set_connection_state(
+                "subscribed",
+                f"Receiving {self.symbol_name} data.",
+                broadcast=False,
+            )
 
     def _report_data_error(self, message: str) -> None:
         logger.error(message)
@@ -191,16 +255,23 @@ class LiveCTraderFeed:
         request = ProtoOAApplicationAuthReq()
         request.clientId = self.client_id
         request.clientSecret = self.client_secret
-        client.send(request)
+        self._send(client, request)
 
-    def _on_disconnected(self, _, reason) -> None:
-        if self._account_refresh is not None and self._account_refresh.running:
-            self._account_refresh.stop()
+    def _clear_session_data(self) -> None:
         self._latest_bid = None
         self._latest_ask = None
         self._active_candles.clear()
         self._confirmed_subscriptions.clear()
         self._pending_account_responses.clear()
+        self._subscription_requests_sent = 0
+        self._subscription_responses_received = 0
+
+    def _on_disconnected(self, _, reason) -> None:
+        if self._account_refresh is not None and self._account_refresh.running:
+            self._account_refresh.stop()
+        for feed in self._group():
+            feed._clear_session_data()
+            feed._unavailable = False
         self._set_connection_state("disconnected", f"Disconnected from cTrader: {reason}")
 
     def _on_message(self, client, message) -> None:
@@ -215,12 +286,12 @@ class LiveCTraderFeed:
             request = ProtoOAAccountAuthReq()
             request.ctidTraderAccountId = self.account_id
             request.accessToken = self.access_token
-            client.send(request)
+            self._send(client, request)
             self._set_connection_state("authenticated", "Application authenticated.")
         elif payload_type == ProtoOAAccountAuthRes().payloadType:
             request = ProtoOASymbolsListReq()
             request.ctidTraderAccountId = self.account_id
-            client.send(request)
+            self._send(client, request)
             if self.track_account:
                 self._request_account_facts()
                 self._account_refresh = LoopingCall(self._request_account_facts)
@@ -231,13 +302,23 @@ class LiveCTraderFeed:
         elif payload_type == ProtoOAGetPositionUnrealizedPnLRes().payloadType:
             self._on_position_pnl_response(Protobuf.extract(message))
         elif payload_type == ProtoOASymbolsListRes().payloadType:
-            self._on_symbols_list(client, Protobuf.extract(message))
+            response = Protobuf.extract(message)
+            self._on_symbols_list(client, response)
+            if self.connection_state != "error":
+                for child in self._children:
+                    child._on_symbols_list(client, response)
         elif payload_type == ProtoOASymbolByIdRes().payloadType:
-            self._on_symbol_details(Protobuf.extract(message))
+            response = Protobuf.extract(message)
+            for feed in self._group():
+                feed._on_symbol_details(response)
         elif payload_type == ProtoOASymbolChangedEvent().payloadType:
-            self._on_symbol_changed(client, Protobuf.extract(message))
+            event = Protobuf.extract(message)
+            for feed in self._group():
+                feed._on_symbol_changed(client, event)
         elif payload_type == ProtoOASpotEvent().payloadType:
-            self._on_spot_event(Protobuf.extract(message))
+            event = Protobuf.extract(message)
+            for feed in self._group():
+                feed._on_spot_event(event)
         elif payload_type in (
             ProtoOASubscribeSpotsRes().payloadType,
             ProtoOASubscribeLiveTrendbarRes().payloadType,
@@ -258,11 +339,11 @@ class LiveCTraderFeed:
 
         trader_request = ProtoOATraderReq()
         trader_request.ctidTraderAccountId = self.account_id
-        self.client.send(trader_request)
+        self._send(self.client, trader_request)
 
         pnl_request = ProtoOAGetPositionUnrealizedPnLReq()
         pnl_request.ctidTraderAccountId = self.account_id
-        self.client.send(pnl_request)
+        self._send(self.client, pnl_request)
 
     def _on_trader_response(self, response) -> None:
         if response.ctidTraderAccountId != self.account_id:
@@ -368,6 +449,7 @@ class LiveCTraderFeed:
         return next((item for item in symbols if item.symbolId == hit[1]), None)
 
     def _on_symbols_list(self, client, response) -> None:
+        self._unavailable = False
         symbol = next(
             (item for item in response.symbol if item.symbolName == self.symbol_name),
             None,
@@ -379,7 +461,11 @@ class LiveCTraderFeed:
                 "error",
                 f"cTrader did not provide the requested symbol {self.symbol_name}.",
             )
-            client.stopService()
+            if self._parent is None:
+                client.stopService()
+            else:
+                # One missing instrument must not stop the shared connection.
+                self._unavailable = True
             return
 
         self.symbol_id = symbol.symbolId
@@ -416,7 +502,7 @@ class LiveCTraderFeed:
         symbol_request = ProtoOASymbolByIdReq()
         symbol_request.ctidTraderAccountId = self.account_id
         symbol_request.symbolId.append(self.symbol_id)
-        client.send(symbol_request)
+        self._send(client, symbol_request, self.symbol_name)
 
     def _on_symbol_details(self, response) -> None:
         if (
@@ -432,6 +518,8 @@ class LiveCTraderFeed:
             None,
         )
         if symbol is None:
+            if self._parent is not None or self._children:
+                return  # the reply was about another instrument on this connection
             self._report_data_error(
                 f"cTrader did not provide full broker specifications for "
                 f"{self.symbol_name}."
@@ -479,27 +567,43 @@ class LiveCTraderFeed:
         spot_request = ProtoOASubscribeSpotsReq()
         spot_request.ctidTraderAccountId = self.account_id
         spot_request.symbolId.append(self.symbol_id)
-        client.send(spot_request)
+        # Without this flag cTrader sends quotes with no timestamp.
+        spot_request.subscribeToSpotTimestamp = True
+        self._send(client, spot_request, self.symbol_name)
 
         for period in (ProtoOATrendbarPeriod.M1, ProtoOATrendbarPeriod.M5):
             candle_request = ProtoOASubscribeLiveTrendbarReq()
             candle_request.ctidTraderAccountId = self.account_id
             candle_request.symbolId = self.symbol_id
             candle_request.period = period
-            client.send(candle_request)
+            self._send(client, candle_request, self.symbol_name)
+        root = self._parent if self._parent is not None else self
+        root._subscription_requests_sent += 3
         self._set_connection_state(
             "subscribing",
             f"Subscribing to {self.symbol_name} quotes and M1/M5 candles.",
+            broadcast=False,
         )
 
     def _on_subscription_confirmed(self, payload_type: int) -> None:
         self._confirmed_subscriptions.add(payload_type)
+        self._subscription_responses_received += 1
         expected = {
             ProtoOASubscribeSpotsRes().payloadType,
             ProtoOASubscribeLiveTrendbarRes().payloadType,
         }
-        if expected.issubset(self._confirmed_subscriptions):
-            self._set_connection_state("subscribed", f"Receiving {self.symbol_name} data.")
+        if not expected.issubset(self._confirmed_subscriptions):
+            return
+        # Every instrument on this connection must be confirmed, not just the first.
+        if self._subscription_responses_received < self._subscription_requests_sent:
+            return
+        for feed in self._group():
+            if not feed._unavailable and feed.symbol_id is not None:
+                feed._set_connection_state(
+                    "subscribed",
+                    f"Receiving {feed.symbol_name} data.",
+                    broadcast=False,
+                )
 
     def _on_spot_event(self, event) -> None:
         if (
@@ -516,6 +620,7 @@ class LiveCTraderFeed:
             elif (has_bid and event.bid <= 0) or (has_ask and event.ask <= 0):
                 self._report_data_error("Ignoring a quote with a non-positive price.")
             else:
+                self._mark_receiving_data()
                 if has_bid:
                     self._latest_bid = event.bid / CTRADER_PRICE_SCALE
                 if has_ask:
@@ -549,6 +654,8 @@ class LiveCTraderFeed:
         ):
             timeframe = periods.get(trendbar.period)
             if timeframe is not None:
+                if trendbar.utcTimestampInMinutes > 0:
+                    self._mark_receiving_data()
                 closed_candle = self._update_candle(trendbar, timeframe)
                 if closed_candle is not None:
                     closed_candles.append(closed_candle)
@@ -628,15 +735,6 @@ class LiveCTraderFeed:
 
         self._active_candles[timeframe] = candle
         return active_candle
-
-    def connect(self) -> None:
-        """Start this feed on a Twisted reactor that is already running.
-
-        Used when several feeds share one reactor. Must be called from the reactor
-        thread (for example through reactor.callFromThread).
-        """
-        self._set_connection_state("connecting", f"Starting cTrader feed for {self.symbol_name}.")
-        self.client.startService()
 
     def start(self, install_signal_handlers: bool = True) -> None:
         if reactor.running:
