@@ -242,7 +242,9 @@ export const api = {
       return clone(AVAILABLE_PAIRS);
     }
     // Real FastAPI call replaces mock data
-    return requestJson<ForexPair[]>('/api/market/pairs');
+    const pairs = await requestJson<{ symbol: string; displayName: string }[]>('/api/market/pairs');
+    const known: string[] = [...AVAILABLE_PAIRS];
+    return pairs.map((pair) => pair.symbol).filter((symbol): symbol is ForexPair => known.includes(symbol));
   },
 
   async getLiveMarketData(): Promise<LiveMarketDataInfo> {
