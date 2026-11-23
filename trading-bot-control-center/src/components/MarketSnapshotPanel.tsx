@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { api } from '../services/api';
-import type { MarketSnapshotInfo } from '../types';
 import { formatDateTime } from '../utils/formatters';
+import { fetchMarketSnapshot, useSelectedSymbol } from '../services/liveFeed';
+import type { MarketSnapshotData } from '../services/liveFeed';
 
 const SNAPSHOT_POLL_INTERVAL_MS = 5000;
 const INDICATOR_REPORTS = new Set(['exponential_moving_averages']);
@@ -46,7 +46,8 @@ function ReportDetails({ name, value }: { name: string; value: unknown }) {
 }
 
 export function MarketSnapshotPanel() {
-  const [snapshot, setSnapshot] = useState<MarketSnapshotInfo | null>(null);
+  const [symbol] = useSelectedSymbol();
+  const [snapshot, setSnapshot] = useState<MarketSnapshotData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -54,11 +55,16 @@ export function MarketSnapshotPanel() {
     let active = true;
     let polling = false;
 
+    // A different instrument was picked: drop the old reports so they are never shown by mistake.
+    setSnapshot(null);
+    setError(null);
+    setLoading(true);
+
     const poll = async () => {
       if (polling) return;
       polling = true;
       try {
-        const result = await api.getMarketSnapshot();
+        const result = await fetchMarketSnapshot(symbol);
         if (!active) return;
         setSnapshot(result);
         setError(null);
@@ -81,7 +87,7 @@ export function MarketSnapshotPanel() {
       active = false;
       window.clearInterval(timer);
     };
-  }, []);
+  }, [symbol]);
 
   const contextReports = snapshot
     ? {
@@ -108,7 +114,8 @@ export function MarketSnapshotPanel() {
           </h2>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
             Read-only reports update after completed M1 candles. This panel checks for
-            new reports every five seconds.
+            new reports every five seconds. Showing {symbol}; pick another instrument in
+            the Live Market Feed panel.
           </p>
         </div>
         {snapshot && (
@@ -140,8 +147,8 @@ export function MarketSnapshotPanel() {
       {!snapshot ? (
         <p className="mt-4 text-xs text-slate-500 dark:text-slate-400" role="status">
           {loading
-            ? 'Waiting for the first completed market report.'
-            : 'No market snapshot is available yet.'}
+            ? `Waiting for the first completed market report for ${symbol}.`
+            : `No market snapshot is available yet for ${symbol}.`}
         </p>
       ) : (
         <>

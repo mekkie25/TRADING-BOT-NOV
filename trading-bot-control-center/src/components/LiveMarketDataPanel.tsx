@@ -1,14 +1,28 @@
 import { useEffect, useState } from 'react';
 import { Wifi, WifiOff } from 'lucide-react';
-import { api } from '../services/api';
-import type { LiveMarketDataInfo } from '../types';
-import { formatDateTime, formatPairPrice } from '../utils/formatters';
+import type { ConnectionState } from '../types';
+import { formatDateTime } from '../utils/formatters';
 import { useAppContext } from './AppContext';
+import {
+  fetchAllLive,
+  formatLivePrice,
+  sortSymbols,
+  useSelectedSymbol,
+} from '../services/liveFeed';
+import type { LiveFeedAll } from '../services/liveFeed';
+
+function dotColor(state: ConnectionState): string {
+  if (state === 'Connected') return 'bg-emerald-500';
+  if (state === 'Error') return 'bg-red-500';
+  if (state === 'Connecting') return 'bg-amber-500';
+  return 'bg-slate-400';
+}
 
 export function LiveMarketDataPanel() {
   const { setConnectionDirect } = useAppContext();
-  const [data, setData] = useState<LiveMarketDataInfo | null>(null);
+  const [all, setAll] = useState<LiveFeedAll | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useSelectedSymbol();
 
   useEffect(() => {
     let active = true;
@@ -18,11 +32,12 @@ export function LiveMarketDataPanel() {
       if (polling) return;
       polling = true;
       try {
-        const result = await api.getLiveMarketData();
+        const result = await fetchAllLive();
         if (!active) return;
-        setData(result);
+        setAll(result);
         setError(null);
-        setConnectionDirect(result.connectionState);
+        const headline = result.EURUSD ?? result[Object.keys(result)[0]];
+        setConnectionDirect(headline ? headline.connectionState : 'Disconnected');
       } catch (requestError) {
         if (!active) return;
         const message =
@@ -43,6 +58,13 @@ export function LiveMarketDataPanel() {
       window.clearInterval(timer);
     };
   }, [setConnectionDirect]);
+
+  const symbols = all ? sortSymbols(Object.keys(all)) : [];
+  const activeSymbol = all && all[selected] ? selected : (symbols[0] ?? selected);
+  const data = all ? (all[activeSymbol] ?? null) : null;
+  const connectedCount = symbols.filter(
+    (symbol) => all?.[symbol]?.connectionState === 'Connected',
+  ).length;
 
   const connectionState = error ? 'Error' : data?.connectionState ?? 'Connecting';
   const connected = connectionState === 'Connected';
@@ -65,7 +87,7 @@ export function LiveMarketDataPanel() {
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
             {data
               ? `${data.symbol} · cTrader ${data.environment} · data only`
-              : 'EURUSD · cTrader market data · data only'}
+              : 'cTrader market data · data only'}
           </p>
         </div>
         <div className={`inline-flex items-center gap-1.5 text-xs font-semibold ${statusColor}`}>
@@ -74,17 +96,48 @@ export function LiveMarketDataPanel() {
         </div>
       </div>
 
+      {symbols.length > 0 && (
+        <>
+          <div className="mt-3 flex flex-wrap gap-1.5" role="group" aria-label="Choose instrument">
+            {symbols.map((symbol) => {
+              const state = all?.[symbol]?.connectionState ?? 'Disconnected';
+              const isSelected = symbol === activeSymbol;
+              return (
+                <button
+                  key={symbol}
+                  type="button"
+                  onClick={() => setSelected(symbol)}
+                  aria-pressed={isSelected}
+                  title={`${symbol}: ${state}`}
+                  className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium ${
+                    isSelected
+                      ? 'border-sky-500 bg-sky-50 text-sky-700 dark:bg-sky-950/40 dark:text-sky-300'
+                      : 'border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800/60'
+                  }`}
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full ${dotColor(state)}`} />
+                  {symbol}
+                </button>
+              );
+            })}
+          </div>
+          <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+            {connectedCount} of {symbols.length} instruments connected
+          </p>
+        </>
+      )}
+
       <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
         <div>
           <p className="text-[11px] text-slate-500 dark:text-slate-400">Bid</p>
           <p className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-900 dark:text-slate-100">
-            {data?.quote ? formatPairPrice(data.quote.bid, data.symbol) : '—'}
+            {data?.quote ? formatLivePrice(data.quote.bid, data.symbol) : '—'}
           </p>
         </div>
         <div>
           <p className="text-[11px] text-slate-500 dark:text-slate-400">Ask</p>
           <p className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-900 dark:text-slate-100">
-            {data?.quote ? formatPairPrice(data.quote.ask, data.symbol) : '—'}
+            {data?.quote ? formatLivePrice(data.quote.ask, data.symbol) : '—'}
           </p>
         </div>
         <div>
@@ -93,7 +146,7 @@ export function LiveMarketDataPanel() {
           </p>
           <p className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-900 dark:text-slate-100">
             {data?.lastClosedCandle
-              ? formatPairPrice(data.lastClosedCandle.close, data.lastClosedCandle.symbol)
+              ? formatLivePrice(data.lastClosedCandle.close, data.lastClosedCandle.symbol)
               : '—'}
           </p>
         </div>
