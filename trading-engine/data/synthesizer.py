@@ -68,7 +68,7 @@ def _bucket_starts(times: pd.Series, timeframe: str) -> pd.Series:
     elif timeframe == "D1":
         wall = shifted.dt.normalize()
     elif timeframe == "W1":
-        wall = shifted.dt.normalize() - pd.to_timedelta(shifted.dt.dayofweek, unit="D")
+        wall = shifted.dt.normalize() - pd.to_timedelta(shifted.dt.day_of_week, unit="D")
     else:  # MN1
         wall = shifted.dt.normalize() - pd.to_timedelta(shifted.dt.day - 1, unit="D")
     return _wall_to_utc(wall)
