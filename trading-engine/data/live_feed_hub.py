@@ -12,15 +12,17 @@ from typing import Dict, Iterable, List
 
 from data.live_feed_manager import LiveFeedManager
 
+# TEST ORDER: US30 and NAS100 come right after EURUSD, to see whether the last
+# requests in the list are the ones cTrader does not answer.
 WATCHED_INSTRUMENTS = (
     "EURUSD",
+    "US30",
+    "NAS100",
     "GBPUSD",
     "USDJPY",
     "XAUUSD",
     "BTCUSD",
     "DAX",
-    "US30",
-    "NAS100",
 )
 
 

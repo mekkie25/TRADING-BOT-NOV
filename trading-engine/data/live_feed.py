@@ -4,6 +4,9 @@ One feed normally owns one cTrader connection. Extra instruments can share that
 same connection: build them with parent=<the first feed>. The parent then logs in
 once, asks for every instrument and hands each message to the right instrument.
 cTrader rejects several logins of the same account, so this keeps it to one.
+
+cTrader drops the last requests when about 30 arrive at once, so the shared
+instruments are subscribed one after another, a short time apart.
 """
 
 import logging
@@ -45,6 +48,9 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 CTRADER_PRICE_SCALE = 100_000
 ACCOUNT_FACTS_REFRESH_SECONDS = 30
+# Gap between the instruments that share one connection. Each instrument sends
+# 4 requests, so 0.3 seconds keeps the rate well below a burst.
+CHILD_SUBSCRIBE_SPACING_SECONDS = 0.3
 
 
 @dataclass(frozen=True)
@@ -133,6 +139,7 @@ class LiveCTraderFeed:
         self.track_account = track_account
         self._parent = parent
         self._children: list["LiveCTraderFeed"] = []
+        self._pending_subscriptions: list = []
         self._unavailable = False
         self._subscription_requests_sent = 0
         self._subscription_responses_received = 0
@@ -269,10 +276,35 @@ class LiveCTraderFeed:
     def _on_disconnected(self, _, reason) -> None:
         if self._account_refresh is not None and self._account_refresh.running:
             self._account_refresh.stop()
+        self._cancel_pending_subscriptions()
         for feed in self._group():
             feed._clear_session_data()
             feed._unavailable = False
         self._set_connection_state("disconnected", f"Disconnected from cTrader: {reason}")
+
+    def _cancel_pending_subscriptions(self) -> None:
+        """Forget instruments that were waiting for their turn to subscribe."""
+        for call in self._pending_subscriptions:
+            if call.active():
+                call.cancel()
+        self._pending_subscriptions.clear()
+
+    def _subscribe_children_paced(self, client, response) -> None:
+        """Subscribe the shared instruments one after another, a short time apart.
+
+        The first one starts at once, the next one CHILD_SUBSCRIBE_SPACING_SECONDS
+        later, and so on. When the reactor is not running nothing can be delayed,
+        so every instrument starts at once.
+        """
+        self._cancel_pending_subscriptions()
+        for position, child in enumerate(self._children):
+            delay = position * CHILD_SUBSCRIBE_SPACING_SECONDS
+            if delay <= 0 or not reactor.running:
+                child._on_symbols_list(client, response)
+            else:
+                self._pending_subscriptions.append(
+                    reactor.callLater(delay, child._on_symbols_list, client, response)
+                )
 
     def _on_message(self, client, message) -> None:
         payload_type = message.payloadType
@@ -305,8 +337,7 @@ class LiveCTraderFeed:
             response = Protobuf.extract(message)
             self._on_symbols_list(client, response)
             if self.connection_state != "error":
-                for child in self._children:
-                    child._on_symbols_list(client, response)
+                self._subscribe_children_paced(client, response)
         elif payload_type == ProtoOASymbolByIdRes().payloadType:
             response = Protobuf.extract(message)
             for feed in self._group():
