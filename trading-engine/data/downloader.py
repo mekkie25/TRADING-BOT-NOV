@@ -19,6 +19,9 @@ than the window. Progress is saved as it goes, so a stopped run loses nothing.
 
 Settings come from a .env file: CTRADER_CLIENT_ID, CTRADER_SECRET,
 CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID. Never share or commit that file.
+CTRADER_ENV chooses the server: demo (the default) or live. A demo account only
+works on the demo server and a live account only on the live server. This program
+only reads candles; it never places orders.
 """
 
 import argparse
@@ -144,6 +147,12 @@ def load_credentials() -> Tuple[Optional[Dict[str, str]], List[str]]:
     return (None if missing else values), missing
 
 
+def selected_environment() -> str:
+    """'live' only when CTRADER_ENV says live. Anything else, or nothing, means demo."""
+    value = os.getenv("CTRADER_ENV", "demo").strip().strip("\"'").lower()
+    return "live" if value == "live" else "demo"
+
+
 class HistoryDownloader:
     """Talks to cTrader one request at a time. Reply handling follows the working EURUSD script."""
 
@@ -175,6 +184,7 @@ class HistoryDownloader:
         self.reactor = None
         self.client = None
         self.credentials: Dict[str, str] = {}
+        self.environment = "demo"
 
     # ----- start and stop -----
 
@@ -184,12 +194,18 @@ class HistoryDownloader:
             print("Missing settings in your .env file: " + ", ".join(missing))
             return 2
         self.credentials = credentials
+        self.environment = selected_environment()
         try:
             self._load_api()
         except ImportError as error:
             print(f"Could not load the cTrader library: {error}")
             return 2
-        self.client = self.api.Client(self.api.EndPoints.PROTOBUF_LIVE_HOST, self.api.EndPoints.PROTOBUF_PORT, self.api.TcpProtocol)
+        host = (
+            self.api.EndPoints.PROTOBUF_LIVE_HOST
+            if self.environment == "live"
+            else self.api.EndPoints.PROTOBUF_DEMO_HOST
+        )
+        self.client = self.api.Client(host, self.api.EndPoints.PROTOBUF_PORT, self.api.TcpProtocol)
         self.client.setConnectedCallback(self.on_connected)
         self.client.setMessageReceivedCallback(self.on_message)
         self.reactor.callLater(10, self._watchdog)
@@ -233,7 +249,7 @@ class HistoryDownloader:
     # ----- messages -----
 
     def on_connected(self, client) -> None:
-        print("Connected to cTrader LIVE API...")
+        print(f"Connected to cTrader {self.environment.upper()} API...")
         request = self.api.AppAuthReq()
         request.clientId = self.credentials["CTRADER_CLIENT_ID"]
         request.clientSecret = self.credentials["CTRADER_SECRET"]
