@@ -1,5 +1,6 @@
 """Tests for the strategy registry and the backtest route that uses it."""
 
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -138,21 +139,80 @@ class BacktestRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("limit for now", response.json()["detail"])
 
-    def test_registered_strategy_runs_from_the_route_and_reports_its_own_timeframe(self):
+    def wait_for_job(self, job_id, wanted=("completed", "failed", "cancelled"), seconds=90):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            job = self.client.get(f"/api/backtests/jobs/{job_id}").json()
+            if job["status"] in wanted:
+                return job
+            time.sleep(0.2)
+        self.fail("The backtest job did not finish in time.")
+
+    def test_registered_strategy_runs_in_the_background_and_reports_its_own_timeframe(self):
         daily = random_candles(400, minutes=24 * 60)
         with patch.object(api.bar_store, "load_m1", return_value=daily), patch.object(
             api.bar_store, "load_candles", return_value=daily
         ):
             response = self.client.post("/api/backtests/run", json=self.request_body())
 
-        self.assertEqual(response.status_code, 200, response.text)
-        job = response.json()
-        self.assertEqual(job["status"], "completed")
+            self.assertEqual(response.status_code, 200, response.text)
+            started = response.json()
+            self.assertIn(started["status"], ("running", "completed"))
+            self.assertNotIn("_cancel", started)
+            job = self.wait_for_job(started["jobId"])
+
+        self.assertEqual(job["status"], "completed", job)
+        self.assertEqual(job["progressPercent"], 100)
         result = self.client.get(f"/api/backtests/{job['resultId']}").json()
         self.assertEqual(result["config"]["strategyId"], "vwap")
         self.assertEqual(result["config"]["timeframe"], "D1")
         self.assertEqual(result["prototypeStatus"], "unverified")
 
+    def test_a_crashing_strategy_is_reported_as_failed_with_the_reason(self):
+        class Crashing:
+            name = "crashing"
+            timeframe = "D1"
+            symbols = ["EURUSD"]
+
+            def on_bar(self, ctx):
+                raise RuntimeError("boom")
+
+        daily = random_candles(400, minutes=24 * 60)
+        with patch.object(api.bar_store, "load_m1", return_value=daily), patch.object(
+            api.bar_store, "load_candles", return_value=daily
+        ), patch.object(api, "build_strategy", return_value=Crashing()):
+            started = self.client.post("/api/backtests/run", json=self.request_body()).json()
+            job = self.wait_for_job(started["jobId"])
+
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("boom", job["currentStep"])
+
+    def test_a_running_backtest_can_be_cancelled(self):
+        class Slow:
+            name = "slow"
+            timeframe = "D1"
+            symbols = ["EURUSD"]
+
+            def on_bar(self, ctx):
+                time.sleep(0.05)
+
+        daily = random_candles(400, minutes=24 * 60)
+        with patch.object(api.bar_store, "load_m1", return_value=daily), patch.object(
+            api.bar_store, "load_candles", return_value=daily
+        ), patch.object(api, "build_strategy", return_value=Slow()):
+            started = self.client.post("/api/backtests/run", json=self.request_body()).json()
+            cancelled = self.client.post(f"/api/backtests/jobs/{started['jobId']}/cancel").json()
+            time.sleep(0.5)
+            job = self.client.get(f"/api/backtests/jobs/{started['jobId']}").json()
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(job["status"], "cancelled")
+        self.assertEqual(job["currentStep"], "Cancelled by user")
+
+    def test_cancelling_an_unknown_job_gets_a_404(self):
+        self.assertEqual(self.client.post("/api/backtests/jobs/nope/cancel").status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()
+    
