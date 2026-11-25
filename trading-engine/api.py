@@ -11,11 +11,18 @@ import numpy as np
 import pandas as pd
 from broker.ctrader_symbol_specs import build_ctrader_forex_spec
 from broker.lot_sizing import calculate_lot_size
+from data import bar_store
 from data.data_quality import inspect_candle_data
 from data.live_feed_hub import LiveFeedHub
 from data.live_feed_manager import live_feed_manager
 from engine.simulator import BacktestConfig as SimulatorConfig
 from engine.simulator import BacktestSimulator
+from strategies.registry import (
+    STRATEGY_MODULES,
+    build_strategy,
+    default_variant_for,
+    variants_for,
+)
 from strategies.validation_trivial import ValidationTrivial
 from pydantic import BaseModel, Field
 import uuid
@@ -69,6 +76,10 @@ app.add_middleware(
 BACKTESTS = {}
 JOBS = {}
 
+# The simulator replays about 11 ms per candle, so very long runs are refused with a clear
+# message instead of leaving the screen waiting for many minutes.
+MAX_BACKTEST_CANDLES = 8000
+
 
 class BacktestCostRequest(BaseModel):
     spreadPips: float = Field(default=1.0, ge=0)
@@ -79,6 +90,7 @@ class BacktestCostRequest(BaseModel):
 
 class BacktestRequest(BaseModel):
     strategyId: str
+    variant: Optional[str] = None
     pairs: List[str] = Field(default_factory=lambda: ["EURUSD"])
     timeframe: str = "H1"
     historyLength: str = "Max available"
@@ -228,9 +240,33 @@ def get_market_snapshot(symbol: str = "EURUSD"):
         )
     return jsonable_encoder(snapshot, custom_encoder={np.generic: lambda value: value.item()})
 
+def _strategy_entry(strategy_id: str, name: str, is_active: bool, description: str) -> dict:
+    return {
+        "id": strategy_id, "name": name, "isActive": is_active, "currentVersion": "v1.0.0",
+        "versions": [], "indicatorIds": [], "assignedPairs": ["EURUSD"], "fileName": "",
+        "codeSnippet": "", "updatedAt": "", "parameters": [], "gradingRules": {},
+        "description": description,
+    }
+
+
 @app.get("/api/strategies")
 def get_strategies():
-    return [{"id": "validation_trivial", "name": "Validation Trivial", "isActive": True, "currentVersion": "v1.0.0", "versions": [], "indicatorIds": [], "assignedPairs": ["EURUSD"], "fileName": "", "codeSnippet": "", "updatedAt": "", "parameters": [], "gradingRules": {}, "description": ""}]
+    entries = [
+        _strategy_entry(
+            "validation_trivial", "Validation Trivial", True,
+            "Plumbing test only: buys every 10th candle. Not a real strategy.",
+        )
+    ]
+    for strategy_id in STRATEGY_MODULES:
+        variants = variants_for(strategy_id)
+        default_variant = default_variant_for(strategy_id)
+        description = "Built from the master strategy file. Backtests are unverified."
+        if variants:
+            description += f" Variants: {', '.join(variants)}; backtests use '{default_variant}'."
+        entries.append(
+            _strategy_entry(strategy_id, strategy_id.replace("_", " ").title(), False, description)
+        )
+    return entries
 
 # ==============================================================================
 # REAL BACKTESTER ENDPOINTS
@@ -257,12 +293,12 @@ def start_backtest(req: BacktestRequest):
     result_id = f"bt-run-{uuid.uuid4()}"
     started_at = datetime.now(timezone.utc)
 
-    if req.strategyId != "validation_trivial":
-        raise HTTPException(status_code=400, detail="Only validation_trivial is implemented.")
+    if req.strategyId != "validation_trivial" and req.strategyId not in STRATEGY_MODULES:
+        raise HTTPException(status_code=400, detail=f"Unknown strategy: {req.strategyId}.")
     if [pair.upper() for pair in req.pairs] != ["EURUSD"]:
         raise HTTPException(status_code=400, detail="This prototype supports EURUSD only.")
-    if req.timeframe.upper() != "H1":
-        raise HTTPException(status_code=400, detail="This prototype supports H1 data only.")
+    if req.strategyId == "validation_trivial" and req.timeframe.upper() != "H1":
+        raise HTTPException(status_code=400, detail="validation_trivial supports H1 data only.")
     if req.currency.upper() != "USD":
         raise HTTPException(status_code=400, detail="This prototype reports account values in USD.")
     if req.costs.swapPerNight != 0:
@@ -280,10 +316,26 @@ def start_backtest(req: BacktestRequest):
     if req.historyLength != "Max available" and req.historyLength not in years:
         raise HTTPException(status_code=400, detail="Unsupported history length.")
 
-    data_file = Path(__file__).parent / "data" / "EURUSD_H1.parquet"
-    if not data_file.exists():
-        raise HTTPException(status_code=404, detail=f"Local candle data not found: {data_file.name}")
-    df = pd.read_parquet(data_file)
+    if req.strategyId == "validation_trivial":
+        strategy = ValidationTrivial()
+        data_file = Path(__file__).parent / "data" / "EURUSD_H1.parquet"
+        if not data_file.exists():
+            raise HTTPException(status_code=404, detail=f"Local candle data not found: {data_file.name}")
+        df = pd.read_parquet(data_file)
+    else:
+        try:
+            strategy = build_strategy(req.strategyId, req.timeframe, req.variant, "EURUSD")
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        if bar_store.load_m1("EURUSD").empty:
+            raise HTTPException(
+                status_code=404,
+                detail="No stored EURUSD candles were found. Run the candle downloader first.",
+            )
+        try:
+            df = bar_store.load_candles("EURUSD", req.timeframe.upper())
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
     if req.historyLength in years:
         time_column = "time" if "time" in df.columns else "timestamp"
         timestamps = pd.to_datetime(df[time_column], utc=True, errors="coerce")
@@ -296,6 +348,15 @@ def start_backtest(req: BacktestRequest):
             )
         df = df.loc[timestamps >= cutoff].reset_index(drop=True)
 
+    if len(df) > MAX_BACKTEST_CANDLES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"This run would replay {len(df):,} candles; the limit for now is "
+                f"{MAX_BACKTEST_CANDLES:,}. Choose a larger timeframe (H1 or H4) or a shorter history."
+            ),
+        )
+
     data_quality = inspect_candle_data(df, req.timeframe)
     if data_quality.has_errors:
         raise HTTPException(
@@ -306,7 +367,6 @@ def start_backtest(req: BacktestRequest):
             },
         )
 
-    strategy = ValidationTrivial()
     config = SimulatorConfig(
         spread_pips=req.costs.spreadPips,
         commission_per_lot_per_side=req.costs.commissionPerLot,
@@ -408,7 +468,7 @@ def start_backtest(req: BacktestRequest):
             "name": "Prototype Backtest",
             "strategyId": req.strategyId,
             "pairs": ["EURUSD"],
-            "timeframe": "H1",
+            "timeframe": req.timeframe.upper(),
             "historyLength": req.historyLength,
             "startingBalance": req.startingBalance,
             "currency": "USD",
