@@ -1,3 +1,4 @@
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -287,6 +288,50 @@ def get_saved_backtests():
         })
     return summaries
 
+class BacktestCancelled(Exception):
+    """Raised inside the simulation when the person presses Cancel."""
+
+
+class ProgressStrategy:
+    """Wraps a strategy so the job can report progress and be cancelled.
+
+    It forwards every call to the real strategy unchanged; it only counts candles.
+    """
+
+    def __init__(self, inner, total_candles, job):
+        self._inner = inner
+        self._total = max(int(total_candles), 1)
+        self._job = job
+        self._seen = 0
+        self.name = inner.name
+        self.timeframe = inner.timeframe
+        self.symbols = inner.symbols
+
+    def on_bar(self, ctx):
+        if self._job.get("_cancel"):
+            raise BacktestCancelled()
+        self._seen += 1
+        if self._seen % 20 == 0 or self._seen == self._total:
+            self._job["progressPercent"] = min(99, int(100 * self._seen / self._total))
+            self._job["currentStep"] = f"Replaying candles {self._seen:,} of {self._total:,}"
+        return self._inner.on_bar(ctx)
+
+
+def _public_job(job: dict) -> dict:
+    return {key: value for key, value in job.items() if not key.startswith("_")}
+
+
+def _run_backtest_job(job, result_id, started_at, req, strategy, df, data_quality):
+    try:
+        _simulate_and_store(job, result_id, started_at, req, strategy, df, data_quality)
+    except BacktestCancelled:
+        pass  # the cancel route already marked the job as cancelled
+    except Exception as error:  # reported on the screen instead of failing silently
+        if not job.get("_cancel"):
+            job["status"] = "failed"
+            job["currentStep"] = f"Backtest failed: {type(error).__name__}: {error}"[:300]
+
+
 @app.post("/api/backtests/run")
 def start_backtest(req: BacktestRequest):
     job_id = str(uuid.uuid4())
@@ -367,6 +412,23 @@ def start_backtest(req: BacktestRequest):
             },
         )
 
+    job = {
+        "jobId": job_id,
+        "status": "running",
+        "progressPercent": 0,
+        "currentStep": "Starting simulation...",
+        "startedAt": started_at.isoformat(),
+    }
+    JOBS[job_id] = job
+    threading.Thread(
+        target=_run_backtest_job,
+        args=(job, result_id, started_at, req, strategy, df, data_quality),
+        daemon=True,
+    ).start()
+    return _public_job(job)
+
+
+def _simulate_and_store(job, result_id, started_at, req, strategy, df, data_quality):
     config = SimulatorConfig(
         spread_pips=req.costs.spreadPips,
         commission_per_lot_per_side=req.costs.commissionPerLot,
@@ -374,7 +436,7 @@ def start_backtest(req: BacktestRequest):
     )
     sim = BacktestSimulator(
         df=df,
-        strategy=strategy,
+        strategy=ProgressStrategy(strategy, len(df), job),
         starting_balance=req.startingBalance,
         risk_percent=req.riskPerTradePercent,
         config=config,
@@ -531,21 +593,35 @@ def start_backtest(req: BacktestRequest):
         },
     }
 
+    if job.get("_cancel"):
+        return
     BACKTESTS[result_id] = result
-    JOBS[job_id] = {
-        "jobId": job_id,
-        "status": "completed",
-        "progressPercent": 100,
-        "currentStep": "Prototype simulation complete; results are unverified",
-        "startedAt": started_at.isoformat(),
-        "resultId": result_id,
-    }
-
-    return JOBS[job_id]
+    job.update(
+        {
+            "status": "completed",
+            "progressPercent": 100,
+            "currentStep": "Prototype simulation complete; results are unverified",
+            "resultId": result_id,
+        }
+    )
 
 @app.get("/api/backtests/jobs/{job_id}")
 def get_job_status(job_id: str):
-    return JOBS.get(job_id, {"status": "error"})
+    job = JOBS.get(job_id)
+    if job is None:
+        return {"status": "error"}
+    return _public_job(job)
+
+@app.post("/api/backtests/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Backtest job {job_id} not found.")
+    if job["status"] in ("queued", "running"):
+        job["_cancel"] = True
+        job["status"] = "cancelled"
+        job["currentStep"] = "Cancelled by user"
+    return _public_job(job)
 
 @app.get("/api/backtests/{backtest_id}")
 def get_backtest_result(backtest_id: str):
